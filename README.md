@@ -49,7 +49,7 @@ docker run -d \
 - Forward UDP port `14159` from your router/firewall to this host.
 - `--stop-timeout 60` gives the server time to save when you `docker stop` it.
 
-To follow a specific image, change the tag to e.g. `:1.0.0` (or `:1.0`, `:1`).
+To follow a specific image, change the tag to e.g. `:2.0.0` (or `:2.0`, `:2`).
 
 ---
 

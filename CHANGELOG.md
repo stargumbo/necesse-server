@@ -4,9 +4,9 @@ All notable changes to this project are documented here. The format is based on 
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-09-07
+## [2.0.0] - 2026-09-07
 
-First release of the `stargumbo/necesse-server` fork, published as `ghcr.io/stargumbo/necesse-server`. Versioning restarts at 1.0.0; the upstream history below is unchanged.
+First release of the `stargumbo/necesse-server` fork, published as `ghcr.io/stargumbo/necesse-server`. The fork keeps upstream's tags (v0.1.0–v1.3.3), so its own versioning starts above them at 2.0.0; the upstream history below is unchanged.
 
 ### Changed
 - Image is now based on `ghcr.io/steamcmd/steamcmd:debian-13` (official SteamCMD image) instead of `debian:bullseye-slim` with a hand-installed SteamCMD (`Dockerfile`).
