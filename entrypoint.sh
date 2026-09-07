@@ -1,12 +1,22 @@
 #!/bin/sh
 set -eu
 
+# SteamCMD comes from the base image (ghcr.io/steamcmd/steamcmd): the `steamcmd` wrapper keeps
+# per-user state under $HOME/.local/share/Steam. STEAMCMD_DIR only holds the update runscript.
 STEAMCMD_DIR="/steamapps"
 APP_DIR="/app"
 APP_ID="1169370"
 RUN_USER="${CONTAINER_USER:-necesse}"
 RUN_GROUP="${CONTAINER_GROUP:-necesse}"
+RUN_HOME="/home/${RUN_USER}"
+# The Steam build of the dedicated server ships its own JRE (StartServer-nogui.sh uses ./jre/bin/java).
+JAVA_BIN="${JAVA_BIN:-${APP_DIR}/jre/bin/java}"
 AUTO_UPDATE_FLAG_FILE="/tmp/necesse-auto-update"
+# The server only saves on the console `stop` command, not on SIGTERM (verified 2026-09-07: a plain
+# SIGTERM exits in <1s without a save). Its stdin is a FIFO held open by this script, so a stop
+# request can be typed into the console from the TERM trap and from the auto-update monitor.
+CONSOLE_FIFO="/tmp/necesse-console"
+STOP_TIMEOUT_SECONDS="${STOP_TIMEOUT_SECONDS:-50}"
 
 SERVER_PID=""
 AUTO_UPDATE_MONITOR_PID=""
@@ -24,7 +34,8 @@ is_root() {
 
 run_as_user() {
     if is_root; then
-        gosu "${RUN_USER}:${RUN_GROUP}" "$@"
+        # gosu leaves an already-set HOME alone and the base image sets HOME=/root; pin it to the run user.
+        gosu "${RUN_USER}:${RUN_GROUP}" env HOME="${RUN_HOME}" "$@"
     else
         "$@"
     fi
@@ -50,16 +61,16 @@ adjust_permissions() {
 
     chown -R "${RUN_USER}:${RUN_GROUP}" \
         "${APP_DIR}" \
-        "/home/${RUN_USER}" \
+        "${RUN_HOME}" \
         "${STEAMCMD_DIR}"
 }
 
 get_manifest_buildid() {
     # SteamCMD writes manifests into the install dir's steamapps folder when force_install_dir is used.
-    # Fall back to the SteamCMD root for older layouts or if users override directories.
+    # Fall back to the per-user SteamCMD root for older layouts or if users override directories.
     for manifest_path in \
         "${APP_DIR}/steamapps/appmanifest_${APP_ID}.acf" \
-        "${STEAMCMD_DIR}/steamapps/appmanifest_${APP_ID}.acf"
+        "${RUN_HOME}/.local/share/Steam/steamapps/appmanifest_${APP_ID}.acf"
     do
         if [ -f "${manifest_path}" ]; then
             awk -F'"' '/"buildid"/ {print $4; exit}' "${manifest_path}"
@@ -69,7 +80,7 @@ get_manifest_buildid() {
 }
 
 fetch_remote_buildid() {
-    run_as_user "$STEAMCMD_DIR/steamcmd.sh" \
+    run_as_user steamcmd \
         +login anonymous \
         +app_info_update 1 \
         +app_info_print "${APP_ID}" \
@@ -140,7 +151,7 @@ start_auto_update_monitor() {
             if check_for_remote_update; then
                 touch "${AUTO_UPDATE_FLAG_FILE}"
                 echo "Auto-update: stopping server to apply latest build."
-                pkill -f 'Server.jar' >/dev/null 2>&1 || true
+                request_server_stop "${SERVER_PID}"
                 exit 0
             fi
         done
@@ -148,18 +159,54 @@ start_auto_update_monitor() {
     AUTO_UPDATE_MONITOR_PID=$!
 }
 
+open_console() {
+    rm -f "${CONSOLE_FIFO}"
+    mkfifo -m 600 "${CONSOLE_FIFO}"
+    # Read-write so the open never blocks and the server never sees EOF on stdin.
+    exec 3<>"${CONSOLE_FIFO}"
+}
+
+send_console() {
+    printf '%s\n' "$1" >&3
+}
+
+# Ask the server to save and exit via its console; fall back to SIGTERM after STOP_TIMEOUT_SECONDS.
+# Takes the PID to watch so the auto-update monitor (a subshell) can reuse it.
+request_server_stop() {
+    pid="$1"
+    if ! kill -0 "${pid}" 2>/dev/null; then
+        return
+    fi
+
+    echo "Sending console 'stop' so the world is saved (timeout ${STOP_TIMEOUT_SECONDS}s)..."
+    send_console stop
+    waited=0
+    while kill -0 "${pid}" 2>/dev/null && [ "${waited}" -lt "${STOP_TIMEOUT_SECONDS}" ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if kill -0 "${pid}" 2>/dev/null; then
+        echo "Server did not exit within ${STOP_TIMEOUT_SECONDS}s; sending SIGTERM." >&2
+        kill "${pid}" 2>/dev/null || true
+    fi
+}
+
 stop_server() {
     if [ -n "${SERVER_PID}" ]; then
-        if kill -0 "${SERVER_PID}" 2>/dev/null; then
-            kill "${SERVER_PID}" 2>/dev/null || true
-        fi
+        request_server_stop "${SERVER_PID}"
         wait "${SERVER_PID}" 2>/dev/null || true
         SERVER_PID=""
     fi
 }
 
 launch_server() {
-    set -- java
+    if [ ! -x "${JAVA_BIN}" ]; then
+        echo "Bundled JRE not found at ${JAVA_BIN}; the Steam build layout may have changed. Set JAVA_BIN to override." >&2
+        exit 1
+    fi
+
+    set -- "${JAVA_BIN}"
 
     if [ -n "${JAVA_OPTS:-}" ]; then
         # shellcheck disable=SC2086
@@ -245,7 +292,7 @@ launch_server() {
     printf '  %s' "$@"
     printf '\n\n'
 
-    run_as_user "$@" &
+    run_as_user "$@" <&3 &
     SERVER_PID=$!
 }
 
@@ -276,20 +323,20 @@ maybe_update_server() {
 
     if [ ! -f "$APP_DIR/Server.jar" ] || [ "$update_flag" = "true" ]; then
         echo "Running SteamCMD to install or update Necesse..."
-        if run_as_user "$STEAMCMD_DIR/steamcmd.sh" +runscript "$STEAMCMD_DIR/update_necesse.txt"; then
+        if run_as_user steamcmd +runscript "$STEAMCMD_DIR/update_necesse.txt"; then
             echo "SteamCMD run complete."
         else
             result=$?
             echo "SteamCMD failed with exit code ${result}."
             if [ -f "$APP_DIR/Server.jar" ]; then
                 echo "Keeping existing server build; new files were not applied."
-                echo "Check /home/${RUN_USER}/Steam/logs/stderr.txt for SteamCMD details."
+                echo "Check ${RUN_HOME}/.local/share/Steam/logs/stderr.txt for SteamCMD details."
                 rm -f "${AUTO_UPDATE_FLAG_FILE}"
                 return
             fi
 
             echo "No existing server binaries found and SteamCMD failed; aborting start."
-            echo "Check /home/${RUN_USER}/Steam/logs/stderr.txt for SteamCMD details."
+            echo "Check ${RUN_HOME}/.local/share/Steam/logs/stderr.txt for SteamCMD details."
             exit "${result}"
         fi
     fi
@@ -318,4 +365,5 @@ main_loop() {
 trap 'handle_exit' INT TERM
 
 adjust_permissions
+open_console
 main_loop
