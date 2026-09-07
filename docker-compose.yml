@@ -1,8 +1,11 @@
 services:
   necesse:
-    image: andreasgl4ser/necesse-server:${IMAGE_TAG:-latest}
+    image: ghcr.io/stargumbo/necesse-server:${IMAGE_TAG:-latest}
     container_name: necesse
     restart: unless-stopped
+
+    # Give the server time to save the world on shutdown (see README: graceful stop).
+    stop_grace_period: 60s
 
     # Port mapping - UDP 14159 is the default Necesse port
     ports:
@@ -41,7 +44,7 @@ services:
       - PUID=${PUID}
       - PGID=${PGID}
 
-    # Persistent storage for world saves, configs, and logs
+    # Persistent storage for world saves, configs, and logs: one bind mount.
     volumes:
       - ./data:/home/necesse/.config/Necesse
 

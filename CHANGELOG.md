@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format is based on 
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-09-07
+
+First release of the `stargumbo/necesse-server` fork, published as `ghcr.io/stargumbo/necesse-server`. Versioning restarts at 1.0.0; the upstream history below is unchanged.
+
+### Changed
+- Image is now based on `ghcr.io/steamcmd/steamcmd:debian-13` (official SteamCMD image) instead of `debian:bullseye-slim` with a hand-installed SteamCMD (`Dockerfile`).
+- `Server.jar` runs under the JRE bundled with the Steam build (`/app/jre/bin/java`); the distro `openjdk-17-jre-headless` layer is gone. `JAVA_BIN` overrides the path (`entrypoint.sh`).
+- SteamCMD state for the `necesse` user is baked at build time (warm-up, sdk32/sdk64 links, retried `app_update`), so runtime updates start from a working client (`Dockerfile`).
+- Auto-update restarts now stop the server via the console `stop` command instead of `pkill`, so the world is saved before the new build is applied (`entrypoint.sh`).
+- Publishing moved from Docker Hub to GHCR: tag pushes build `:X.Y.Z`, `:X.Y`, `:X`, `:latest`; a Monday cron and manual dispatch rebuild the newest tag with `pull: true`; GitHub Actions pinned by commit SHA (`.github/workflows/publish.yml`, replaces `release.yml`).
+- Compose example targets the GHCR image and sets `stop_grace_period: 60s` (`docker-compose.yml`, `README.md`).
+- `SERVER_PASSWORD` no longer has an image-level default; pass it at run time (`Dockerfile`).
+
+### Added
+- Graceful stop: the server's stdin is a FIFO held open by the entrypoint; the `TERM` trap types `stop` into the console and waits up to `STOP_TIMEOUT_SECONDS` (default 50) for the JVM to exit before falling back to `SIGTERM`. Verified: a plain `SIGTERM` does not save the world; the console `stop` does (`entrypoint.sh`).
+- Dependabot for the `docker` and `github-actions` ecosystems, weekly (`.github/dependabot.yml`).
+- OCI `licenses` label; `source`/`url` labels point at the fork.
+
+### Removed
+- `release.yml` (GitHub release archives + Docker Hub push); superseded by `publish.yml`.
+
+
 ## [1.3.3] - 2025-11-07
 ### Fixed
 - Auto-update watcher now reads SteamCMD manifests from the install directory, preventing hourly restarts when no new Necesse build is available (`entrypoint.sh`).
