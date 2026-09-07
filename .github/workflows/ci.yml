@@ -2,16 +2,18 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: ["main"]
   pull_request:
-    branches: ["**"]
+
+permissions:
+  contents: read
 
 jobs:
   lint-and-build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install shellcheck
         run: |
@@ -22,4 +24,4 @@ jobs:
         run: shellcheck entrypoint.sh
 
       - name: Docker build
-        run: docker build .
+        run: docker build --pull .
