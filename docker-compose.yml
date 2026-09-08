@@ -19,7 +19,8 @@ services:
       - WORLD_NAME=${WORLD_NAME:-MyWorld}
 
       # Server parameters
-      - SERVER_PASSWORD=${SERVER_PASSWORD}
+      - SERVER_PASSWORD=\n      # Or read it from a Docker secret instead (wins over SERVER_PASSWORD); see README: Secrets.
+      # - SERVER_PASSWORD_FILE=/run/secrets/necesse_password
       - SERVER_SLOTS=${SERVER_SLOTS}
       - SERVER_OWNER=${SERVER_OWNER}
       - SERVER_MOTD=${SERVER_MOTD}
@@ -51,3 +52,11 @@ services:
     # Resource limits (optional, adjust as needed)
     mem_limit: 2g
     mem_reservation: 512m
+
+    # Uncomment together with SERVER_PASSWORD_FILE above to feed the password from a file.
+    # secrets:
+    #   - necesse_password
+
+# secrets:
+#   necesse_password:
+#     file: ./necesse_password.txt   # one line; keep it out of git

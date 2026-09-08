@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format is based on 
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-09-07
+
+The join password no longer leaves the secret path. Four exposure surfaces from 2.0.x are closed
+(`entrypoint.sh`, `redact.sh`, `Dockerfile`); the runtime contract is otherwise unchanged and an
+existing `.env` deployment needs no edits.
+
+### Changed
+- The password is written into the `password` field of the game's `cfg/server.cfg` (mode `0600`)
+  before every start instead of being passed as `-password` on the Java command line, so it no
+  longer appears in `docker top`, `ps`, or the game's "Launched game with arguments" log line. On a
+  first start the file is seeded with the game's own defaults so the loader finds every key.
+- The entrypoint no longer echoes the password in its "Starting Necesse server with command" line
+  (there is nothing to echo any more), and drops `SERVER_PASSWORD`/`SERVER_PASSWORD_FILE` from the
+  Java process environment.
+- The server's stdout/stderr are piped through `redact.sh`, a fixed-string (non-regex), line-buffered
+  filter that replaces the password with `****`, so `docker logs` never shows it. The console FIFO
+  used for the graceful `stop` is untouched.
+- The server runs with `umask 077`: its log files, saves and cfg are created `0600`. The game still
+  writes the password into its own log files under the data directory; they are now owner-only.
+
+### Added
+- `SERVER_PASSWORD_FILE`: read the password from a file (first line), e.g. a Docker secret. Takes
+  precedence over `SERVER_PASSWORD`. Missing, unreadable or empty file: the container exits non-zero
+  with a clear message rather than starting without a password.
+- README "Secrets" section; a commented `secrets:` example in `docker-compose.yml`;
+  `SERVER_PASSWORD_FILE` in `.env.example`.
+- Both `SERVER_PASSWORD` and `SERVER_PASSWORD_FILE` unset or blank now prints one stderr warning
+  (the server still starts open, as before). A password containing a comma or `//` is refused
+  because it cannot be stored in `server.cfg`.
+
 ## [2.0.1] - 2026-09-07
 
 ### Fixed

@@ -28,7 +28,7 @@ RUN gosu necesse env HOME=/home/necesse sh -c ' \
    && for i in 1 2 3; do steamcmd +runscript /steamapps/update_necesse.txt && break; echo "SteamCMD attempt $i failed; retrying"; done \
    && test -x /app/jre/bin/java && test -f /app/Server.jar'
 
-COPY --chown=necesse:necesse --chmod=755 entrypoint.sh /app/entrypoint.sh
+COPY --chown=necesse:necesse --chmod=755 entrypoint.sh redact.sh /app/
 WORKDIR /app
 
 LABEL org.opencontainers.image.title="Necesse Dedicated Server" \

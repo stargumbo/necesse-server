@@ -16,10 +16,15 @@ AUTO_UPDATE_FLAG_FILE="/tmp/necesse-auto-update"
 # SIGTERM exits in <1s without a save). Its stdin is a FIFO held open by this script, so a stop
 # request can be typed into the console from the TERM trap and from the auto-update monitor.
 CONSOLE_FIFO="/tmp/necesse-console"
+# The server's stdout/stderr go through a second FIFO into redact.sh, which replaces the join
+# password with **** before anything reaches the container log (the game prints it on start).
+OUTPUT_FIFO="/tmp/necesse-output"
 STOP_TIMEOUT_SECONDS="${STOP_TIMEOUT_SECONDS:-50}"
 
 SERVER_PID=""
 AUTO_UPDATE_MONITOR_PID=""
+REDACTOR_PID=""
+RESOLVED_PASSWORD=""
 SERVER_EXIT_CODE=0
 AUTO_UPDATE_INTERVAL_MINUTES_NORMALIZED=0
 AUTO_UPDATE_INTERVAL_SECONDS=0
@@ -63,6 +68,136 @@ adjust_permissions() {
         "${APP_DIR}" \
         "${RUN_HOME}" \
         "${STEAMCMD_DIR}"
+}
+
+# --- Join password ---------------------------------------------------------------------------
+# The password never goes on the java command line (that shows up in `ps`, `docker top` and the
+# game's own "Launched game with arguments" log line). It is resolved once here, written into the
+# `password` field of server.cfg (mode 0600) before every launch, scrubbed out of the server's
+# stdout/stderr by redact.sh, and removed from the java process environment.
+# SERVER_PASSWORD_FILE (for example a Docker secret under /run/secrets) wins over SERVER_PASSWORD.
+resolve_password() {
+    if [ -n "${SERVER_PASSWORD_FILE:-}" ]; then
+        if [ ! -f "${SERVER_PASSWORD_FILE}" ] || [ ! -r "${SERVER_PASSWORD_FILE}" ]; then
+            echo "SERVER_PASSWORD_FILE is set to '${SERVER_PASSWORD_FILE}' but that file does not exist or is not readable; refusing to start." >&2
+            exit 1
+        fi
+        # First line only, newline stripped: secret files usually end with one.
+        RESOLVED_PASSWORD="$(head -n 1 "${SERVER_PASSWORD_FILE}")"
+        if [ -z "${RESOLVED_PASSWORD}" ]; then
+            echo "SERVER_PASSWORD_FILE '${SERVER_PASSWORD_FILE}' is empty; refusing to start without a password. Unset it to run an open server." >&2
+            exit 1
+        fi
+        echo "Join password: read from SERVER_PASSWORD_FILE."
+    else
+        RESOLVED_PASSWORD="${SERVER_PASSWORD:-}"
+        if [ -n "${RESOLVED_PASSWORD}" ]; then
+            echo "Join password: read from SERVER_PASSWORD."
+        fi
+    fi
+
+    if [ -z "${RESOLVED_PASSWORD}" ]; then
+        echo "Warning: neither SERVER_PASSWORD nor SERVER_PASSWORD_FILE is set; the server will accept joins without a password." >&2
+        return
+    fi
+
+    # server.cfg is `key = value, // comment` per line, so these two sequences cannot be stored.
+    case "${RESOLVED_PASSWORD}" in
+        *,*|*//*)
+            echo "The join password may not contain a comma or '//' (server.cfg syntax); refusing to start." >&2
+            exit 1
+            ;;
+    esac
+}
+
+# Where the game reads server.cfg from, mirroring the flags launch_server passes.
+server_cfg_path() {
+    if [ -n "${SETTINGS_FILE:-}" ]; then
+        printf '%s' "${SETTINGS_FILE}"
+        return
+    fi
+
+    local_dir_flag="$(lowercase "${LOCAL_DIR:-0}")"
+    if [ "$local_dir_flag" = "1" ] || [ "$local_dir_flag" = "true" ]; then
+        printf '%s' "${APP_DIR}/cfg/server.cfg"
+    elif [ -n "${DATA_DIR:-}" ]; then
+        printf '%s' "${DATA_DIR}/cfg/server.cfg"
+    else
+        printf '%s' "${RUN_HOME}/.config/Necesse/cfg/server.cfg"
+    fi
+}
+
+# Rewrite the `password` field every start, blank included: the game keeps whatever the file says,
+# so a password removed from the environment must also be removed from the file.
+write_password_to_cfg() {
+    cfg="$(server_cfg_path)"
+    cfg_dir="$(dirname "${cfg}")"
+    if [ ! -d "${cfg_dir}" ]; then
+        # First start on an empty bind mount: create cfg/ as the run user, or the game cannot write settings.cfg next to it.
+        mkdir -p "${cfg_dir}"
+        if is_root; then
+            chown "${RUN_USER}:${RUN_GROUP}" "${cfg_dir}"
+        fi
+    fi
+    tmp="${cfg}.tmp.$$"
+
+    if [ ! -f "${cfg}" ]; then
+        # First start: seed the file with the game's own defaults (verbatim from what build 24926481
+        # writes) so the loader finds every key; a password-only file makes it warn on every start.
+        # Values the entrypoint passes on the command line (port, slots, ...) override these anyway.
+        cat > "${tmp}" <<'CFG'
+SERVER = {
+	port = 14159, // [0 - 65535] Server default port
+	slots = 10, // [1 - 250] Server default slots
+	password = , // Leave blank for no password
+	maxClientLatencySeconds = 30,
+	pauseWhenEmpty = true,
+	strictServerAuthority = false, // If true, server will be much more strict about what clients can do. It is strongly recommended to ONLY have this enabled if absolutely necessary
+	logging = true, // If true, will create log files for each server start
+	language = en,
+	unloadLevelsCooldown = 30, // The number of seconds a level will stay loaded after the last player has left it
+	droppedItemsLifeMinutes = 0, // Minutes that dropped items will stay in the world. 0 or less for indefinite
+	unloadSettlements = false, // If the server should unload player settlements or keep them loaded
+	maxSettlementsPerPlayer = -1, // The maximum amount of settlements per player. -1 or less means infinite
+	maxSettlersPerSettlement = -1, // The maximum amount of settlers per settlement. -1 or less means infinite
+	zipSaves = true, // If true, will create new saves uncompressed
+	MOTD =  // Message of the day
+}
+CFG
+        chmod 600 "${tmp}"
+        if is_root; then
+            chown "${RUN_USER}:${RUN_GROUP}" "${tmp}"
+        fi
+        mv -f "${tmp}" "${cfg}"
+    fi
+
+    if ! grep -q '^[[:space:]]*password[[:space:]]*=' "${cfg}"; then
+        if ! grep -q '^[[:space:]]*SERVER[[:space:]]*=[[:space:]]*{' "${cfg}"; then
+            echo "${cfg} has no 'password' field and no 'SERVER = {' block to add one to; refusing to start." >&2
+            exit 1
+        fi
+        # Custom settings file without the key: add it right after the block opener.
+        awk '{ print } /^[[:space:]]*SERVER[[:space:]]*=[[:space:]]*\{/ && !done { print "\tpassword = , // Leave blank for no password"; done = 1 }' "${cfg}" > "${tmp}"
+        mv -f "${tmp}" "${cfg}"
+    fi
+
+    # Replace the value in place, keeping the trailing comment. The value travels through the
+    # environment rather than -v so awk does not interpret backslashes in it.
+    NECESSE_CFG_PASSWORD="${RESOLVED_PASSWORD}" awk '
+        /^[[:space:]]*password[[:space:]]*=/ && !done {
+            comment = ""
+            if (match($0, /\/\/.*$/)) { comment = " " substr($0, RSTART) }
+            print "\tpassword = " ENVIRON["NECESSE_CFG_PASSWORD"] "," comment
+            done = 1
+            next
+        }
+        { print }' "${cfg}" > "${tmp}"
+
+    chmod 600 "${tmp}"
+    if is_root; then
+        chown "${RUN_USER}:${RUN_GROUP}" "${tmp}"
+    fi
+    mv -f "${tmp}" "${cfg}"
 }
 
 get_manifest_buildid() {
@@ -145,6 +280,8 @@ start_auto_update_monitor() {
 
     echo "Auto-update: enabled; checking for new builds every ${AUTO_UPDATE_INTERVAL_MINUTES_NORMALIZED} minute(s)."
 
+    # The monitor keeps fd 3 (console) but must not hold the output FIFO's write end, or the
+    # redactor would never see EOF at shutdown.
     (
         while true; do
             sleep "${seconds}"
@@ -155,7 +292,7 @@ start_auto_update_monitor() {
                 exit 0
             fi
         done
-    ) &
+    ) 4>&- &
     AUTO_UPDATE_MONITOR_PID=$!
 }
 
@@ -164,6 +301,25 @@ open_console() {
     mkfifo -m 600 "${CONSOLE_FIFO}"
     # Read-write so the open never blocks and the server never sees EOF on stdin.
     exec 3<>"${CONSOLE_FIFO}"
+}
+
+# One redactor lives for the whole container: fd 4 keeps the FIFO open read-write so the reader
+# survives server restarts (auto-update) and only sees EOF once close_output drops fd 4.
+open_output() {
+    rm -f "${OUTPUT_FIFO}"
+    mkfifo -m 600 "${OUTPUT_FIFO}"
+    exec 4<>"${OUTPUT_FIFO}"
+    NECESSE_REDACT_SECRET="${RESOLVED_PASSWORD}" bash "${APP_DIR}/redact.sh" <"${OUTPUT_FIFO}" 3>&- 4>&- &
+    REDACTOR_PID=$!
+}
+
+# Call only after the server has exited: closing fd 4 lets the redactor drain and finish.
+close_output() {
+    exec 4>&-
+    if [ -n "${REDACTOR_PID}" ]; then
+        wait "${REDACTOR_PID}" 2>/dev/null || true
+        REDACTOR_PID=""
+    fi
 }
 
 send_console() {
@@ -205,6 +361,8 @@ launch_server() {
         echo "Bundled JRE not found at ${JAVA_BIN}; the Steam build layout may have changed. Set JAVA_BIN to override." >&2
         exit 1
     fi
+
+    write_password_to_cfg
 
     set -- "${JAVA_BIN}"
 
@@ -252,9 +410,7 @@ launch_server() {
         set -- "$@" -motd "${SERVER_MOTD}"
     fi
 
-    if [ -n "${SERVER_PASSWORD:-}" ]; then
-        set -- "$@" -password "${SERVER_PASSWORD}"
-    fi
+    # No -password here: the game reads it from server.cfg (see write_password_to_cfg).
 
     if [ -n "${PAUSE_WHEN_EMPTY:-}" ]; then
         set -- "$@" -pausewhenempty "${PAUSE_WHEN_EMPTY}"
@@ -292,7 +448,17 @@ launch_server() {
     printf '  %s' "$@"
     printf '\n\n'
 
-    run_as_user "$@" <&3 &
+    # stdin: the console FIFO. stdout/stderr: the output FIFO feeding redact.sh. umask 077 makes
+    # every file the game creates (logs, saves, cfg) 0600. The password variables are dropped from
+    # the environment, and the child closes fds 3/4 so it holds neither FIFO's spare end.
+    (
+        umask 077
+        if is_root; then
+            exec gosu "${RUN_USER}:${RUN_GROUP}" env -u SERVER_PASSWORD -u SERVER_PASSWORD_FILE HOME="${RUN_HOME}" "$@"
+        else
+            exec env -u SERVER_PASSWORD -u SERVER_PASSWORD_FILE "$@"
+        fi
+    ) <&3 >"${OUTPUT_FIFO}" 2>&1 3>&- 4>&- &
     SERVER_PID=$!
 }
 
@@ -311,6 +477,7 @@ handle_exit() {
     trap - INT TERM
     stop_auto_update_monitor
     stop_server
+    close_output
     exit 0
 }
 
@@ -358,6 +525,7 @@ main_loop() {
             continue
         fi
 
+        close_output
         exit "${SERVER_EXIT_CODE}"
     done
 }
@@ -365,5 +533,7 @@ main_loop() {
 trap 'handle_exit' INT TERM
 
 adjust_permissions
+resolve_password
 open_console
+open_output
 main_loop

@@ -24,6 +24,9 @@ This is a fork of [andreas-glaser/necesse-docker-server](https://github.com/andr
 - **GHCR publishing with weekly rebuilds.** Tag pushes build `:X.Y.Z`, `:X.Y`, `:X` and `:latest`;
   a Monday cron rebuilds the newest tag with `pull: true` so the base image and the Steam server
   build refresh unattended. All GitHub Actions are pinned by commit SHA; Dependabot tracks both.
+- **The join password stays off the command line and out of the logs.** Written to `cfg/server.cfg`
+  (0600), redacted from `docker logs`, removed from the Java environment; `SERVER_PASSWORD_FILE`
+  takes a Docker secret. See Secrets below.
 - **amd64 only.**
 
 ---
@@ -94,12 +97,57 @@ orchestrator, not through the image.
 
 ---
 
+## Secrets
+
+The join password is the one real secret this image handles, and since 2.1.0 it stays on a
+narrow path:
+
+- **Two inputs.** `SERVER_PASSWORD` (plain environment variable, as before) or
+  `SERVER_PASSWORD_FILE` (path of a file whose first line is the password, e.g. a Docker
+  secret under `/run/secrets/`). If both are set, **`SERVER_PASSWORD_FILE` wins**. Both unset
+  or blank: the server starts without a password and prints one warning on stderr. A
+  `SERVER_PASSWORD_FILE` that is missing, unreadable or empty makes the container exit
+  non-zero instead of silently starting open.
+- **Never on the command line.** The entrypoint writes the password into the `password`
+  field of the game's `cfg/server.cfg` (mode `0600`) before each start and does not pass
+  `-password`, so `docker top`, `ps` and the game's own "Launched game with arguments" line
+  never carry it. It is also removed from the Java process environment.
+- **Redacted output.** The game prints the password on start (`Started server ... with
+  password "..."`). Its stdout/stderr pass through `redact.sh`, a fixed-string filter, so
+  `docker logs` shows `****` instead. Any character is fine; the filter is not a regex.
+- **Appdata files are `0600`.** The server runs with `umask 077`, so its log files (which
+  do contain the password, unredacted), saves and cfg are created readable by the owner
+  only. Treat `latest-server-log.txt` and `logs/*.txt` as sensitive anyway: they live on the
+  host, and anything that copies the data directory (backups) copies the password with it.
+- **Two characters are off limits:** a comma or `//` in the password would break the
+  `server.cfg` syntax, so the entrypoint refuses to start with either.
+
+Compose with a Docker secret:
+
+```yaml
+services:
+  necesse:
+    image: ghcr.io/stargumbo/necesse-server:2
+    environment:
+      - SERVER_PASSWORD_FILE=/run/secrets/necesse_password
+    secrets:
+      - necesse_password
+secrets:
+  necesse_password:
+    file: ./necesse_password.txt   # one line, not committed
+```
+
+The plain `.env` route (`SERVER_PASSWORD=...` with `env_file: .env`) keeps working unchanged.
+
+---
+
 ## Environment Variables
 
 | Variable | Purpose |
 | --- | --- |
 | `WORLD_NAME` | World to load or create. |
-| `SERVER_PASSWORD` | Join password; blank disables. |
+| `SERVER_PASSWORD` | Join password; blank disables. Written into `cfg/server.cfg`, never passed on the command line (see Secrets). |
+| `SERVER_PASSWORD_FILE` | Path of a file holding the password (first line), e.g. a Docker secret. Wins over `SERVER_PASSWORD`. Missing/unreadable/empty file = container exits. |
 | `SERVER_SLOTS` | Maximum concurrent players (1–250). |
 | `SERVER_OWNER` | Owner player name (grants admin on join). |
 | `SERVER_MOTD` | Message shown on join (`\n` for newline). |
@@ -130,7 +178,8 @@ orchestrator, not through the image.
   `saves/worlds/<name>.zip`, config under `cfg/`, logs under `logs/`. Back it up regularly before
   upgrades or migrations.
 - Set `PUID`/`PGID` to the owner you want for the bind mount. Files the server writes are owned by
-  that UID:GID.
+  that UID:GID and created `0600` (directories `0700`): the server runs with `umask 077` because its
+  log files contain the join password.
 - Health check: `pgrep -f 'Server.jar'`. Use `docker compose ps` or
   `docker inspect --format '{{.State.Health.Status}}' necesse` to verify.
 - Tail logs with `docker compose logs -f necesse` or from `data/logs/`.
