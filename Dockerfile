@@ -47,8 +47,10 @@ ENV CONTAINER_USER=necesse CONTAINER_GROUP=necesse CONTAINER_UID=${uid} CONTAINE
     UPDATE_ON_START=false AUTO_UPDATE_INTERVAL_MINUTES=0 JAVA_OPTS=
 
 EXPOSE 14159/udp
+# Exec form on purpose: a shell-form check runs inside `sh -c "pgrep -f 'Server.jar' ..."`, whose own
+# argv contains Server.jar, so pgrep matched the wrapper and the container was always "healthy" (2.0.0 bug).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD pgrep -f 'Server.jar' >/dev/null || exit 1
+  CMD ["pgrep", "-f", "Server.jar"]
 VOLUME ["/home/necesse/.config/Necesse"]
 
 # The base image's ENTRYPOINT is steamcmd itself; replace it.

@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format is based on 
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-09-07
+
+### Fixed
+- The image `HEALTHCHECK` was shell-form, so `pgrep -f 'Server.jar'` ran inside `sh -c "..."` whose own argv contains `Server.jar`; pgrep matched that wrapper shell, the container reported healthy from the first check (while SteamCMD was still installing) and could never become unhealthy. The check is now exec-form (`["pgrep", "-f", "Server.jar"]`), so there is no wrapper to self-match and health follows the real `Server.jar` process (`Dockerfile`). Found on the 2.0.0 deploy.
+
 ## [2.0.0] - 2026-09-07
 
 First release of the `stargumbo/necesse-server` fork, published as `ghcr.io/stargumbo/necesse-server`. The fork keeps upstream's tags (v0.1.0–v1.3.3), so its own versioning starts above them at 2.0.0; the upstream history below is unchanged.
