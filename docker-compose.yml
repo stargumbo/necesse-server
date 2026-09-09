@@ -42,6 +42,10 @@ services:
       - UPDATE_ON_START=${UPDATE_ON_START}
       - AUTO_UPDATE_INTERVAL_MINUTES=${AUTO_UPDATE_INTERVAL_MINUTES:-0}
       - JAVA_OPTS=${JAVA_OPTS}
+
+      # Steam Workshop mods (see README: Workshop mods)
+      - MODS_WORKSHOP=${MODS_WORKSHOP}
+      - MODS_FAIL_FAST=${MODS_FAIL_FAST:-true}
       - PUID=${PUID}
       - PGID=${PGID}
 

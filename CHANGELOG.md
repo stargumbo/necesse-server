@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format is based on 
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-09-09
+
+Steam Workshop mods can now be installed by the container itself. With `MODS_WORKSHOP` unset the
+image behaves exactly as 2.1.0: no SteamCMD Workshop call, no writes to `mods/`, no new log lines.
+
+### Added
+- `MODS_WORKSHOP`: comma-separated Workshop item ids. At container start, before the server
+  launches, each id is fetched with an anonymous SteamCMD login (`workshop_download_item 1169040`)
+  and its single jar is copied flat into `<data>/mods/` as `ws-<id>-<OriginalName>.jar` (`0600`,
+  `PUID:PGID`). The game only loads bare jars from that directory and SteamCMD's download lands
+  outside the bind mount, hence the copy. An unchanged item is revalidated and the existing copy is
+  left untouched (`entrypoint.sh`).
+- Managed-jar semantics: only `ws-<id>-*.jar` files are managed. On each start, managed jars whose
+  id is no longer listed are deleted; that is the only deletion the entrypoint performs. Jars the
+  operator places in `mods/` are never touched. Clearing `MODS_WORKSHOP` turns the feature off and
+  leaves `mods/` as it is.
+- `MODS_FAIL_FAST` (default `true`): a failed download exits the container non-zero before the
+  server starts, naming the id, because a partial mod set changes the mods hash and locks every
+  subscribed player out. `false` logs a warning and starts with what fetched.
+- `<data>/ws-manifest.txt` (beside `mods/`, since the game warns about non-jar files inside it),
+  rewritten after each fetch: one line per listed id with the jar
+  name, the Workshop `manifest` and `timeupdated` values, and `status=ok|failed`, so the operator
+  can see which Workshop revision is live.
+- `MODS_WORKSHOP` together with `LOCAL_DIR=1` is refused with a clear message: with `-localdir` the
+  game reads mods from `/app/mods` inside the image, where managed jars would not persist.
+- README "Workshop mods" section with a "For players" subsection (players must subscribe to the
+  same ids themselves; the server cannot push mods; "Use server mods" cannot download;
+  `clientside=true` mods do not need to match; older-`gameVersion` mods load without warning;
+  same-id different-version joins are untested). `MODS_WORKSHOP` and `MODS_FAIL_FAST` in
+  `.env.example`, `docker-compose.yml` and the image `ENV` defaults.
+
 ## [2.1.0] - 2026-09-07
 
 The join password no longer leaves the secret path. Four exposure surfaces from 2.0.x are closed

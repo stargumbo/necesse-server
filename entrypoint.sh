@@ -20,6 +20,9 @@ CONSOLE_FIFO="/tmp/necesse-console"
 # password with **** before anything reaches the container log (the game prints it on start).
 OUTPUT_FIFO="/tmp/necesse-output"
 STOP_TIMEOUT_SECONDS="${STOP_TIMEOUT_SECONDS:-50}"
+# Steam Workshop items are published under the client app id, not the dedicated server's.
+WORKSHOP_APP_ID="1169040"
+WORKSHOP_STEAM_DIR="${RUN_HOME}/.local/share/Steam/steamapps/workshop"
 
 SERVER_PID=""
 AUTO_UPDATE_MONITOR_PID=""
@@ -198,6 +201,203 @@ CFG
         chown "${RUN_USER}:${RUN_GROUP}" "${tmp}"
     fi
     mv -f "${tmp}" "${cfg}"
+}
+
+# --- Steam Workshop mods -----------------------------------------------------------------------
+# MODS_WORKSHOP is a comma-separated list of Workshop item ids. Before the first server launch each
+# one is fetched with an anonymous SteamCMD login and the single jar it contains is copied FLAT into
+# <datadir>/mods as ws-<id>-<OriginalName>.jar: the game only loads bare jars from that directory,
+# and SteamCMD's own download lands outside the bind mount, so it would vanish on recreate.
+# Jars carrying the ws- prefix are managed: on every start the ones whose id is no longer listed
+# are deleted, and that is the only deletion this script ever performs. Anything else in mods/ is
+# left alone. The fetch runs once per container start, never while Server.jar is running and not on
+# auto-update restarts. An empty MODS_WORKSHOP leaves mods/ untouched (2.1.0 behaviour).
+MODS_WORKSHOP_IDS=""
+
+mods_dir() {
+    if [ -n "${DATA_DIR:-}" ]; then
+        printf '%s' "${DATA_DIR}/mods"
+    else
+        printf '%s' "${RUN_HOME}/.config/Necesse/mods"
+    fi
+}
+
+# Default on: a partial mod set changes the mods hash and silently locks every player out, which is
+# worse than not starting.
+mods_fail_fast() {
+    flag="$(lowercase "${MODS_FAIL_FAST:-true}")"
+    [ "${flag}" != "false" ] && [ "${flag}" != "0" ] && [ "${flag}" != "no" ]
+}
+
+# Cheap checks first, so a bad list or a LOCAL_DIR conflict fails before SteamCMD is touched.
+validate_workshop_config() {
+    MODS_WORKSHOP_IDS=""
+    if [ -z "${MODS_WORKSHOP:-}" ]; then
+        return
+    fi
+
+    local_dir_flag="$(lowercase "${LOCAL_DIR:-0}")"
+    if [ "$local_dir_flag" = "1" ] || [ "$local_dir_flag" = "true" ]; then
+        echo "MODS_WORKSHOP cannot be combined with LOCAL_DIR=1: with -localdir the game loads mods from ${APP_DIR}/mods inside the image, not from the data directory, so managed jars would not persist. Refusing to start." >&2
+        exit 1
+    fi
+
+    # shellcheck disable=SC2086
+    for id in $(printf '%s' "${MODS_WORKSHOP}" | tr ',' ' '); do
+        case "${id}" in
+            *[!0-9]*)
+                echo "MODS_WORKSHOP entry '${id}' is not a numeric Steam Workshop item id; refusing to start." >&2
+                exit 1
+                ;;
+        esac
+        case " ${MODS_WORKSHOP_IDS} " in
+            *" ${id} "*) ;;
+            *) MODS_WORKSHOP_IDS="${MODS_WORKSHOP_IDS}${MODS_WORKSHOP_IDS:+ }${id}" ;;
+        esac
+    done
+}
+
+# One field of one item from the WorkshopItemsInstalled block of appworkshop_<app>.acf.
+workshop_acf_field() {
+    acf="${WORKSHOP_STEAM_DIR}/appworkshop_${WORKSHOP_APP_ID}.acf"
+    [ -f "${acf}" ] || return 0
+    awk -v id="$1" -v field="$2" -F'"' '
+        $2 == "WorkshopItemsInstalled" { installed = 1; next }
+        installed && $2 == "WorkshopItemDetails" { installed = 0 }
+        installed && !inside && $2 == id { inside = 1; next }
+        inside && $2 == field { print $4; exit }
+        inside && /^[[:space:]]*}/ { inside = 0 }
+    ' "${acf}"
+}
+
+# ws-manifest.txt: one line per listed id so the operator can see which Workshop revision is live.
+# It lives beside mods/, not inside it: the game scans every file in mods/ and logs a WARN for each
+# non-jar it finds there.
+write_workshop_manifest() {
+    dir="$1"
+    failed_ids="$2"
+    manifest="${dir%/mods}/ws-manifest.txt"
+    tmp="${manifest}.tmp.$$"
+    : > "${tmp}"
+    for id in ${MODS_WORKSHOP_IDS}; do
+        jar="$(find "${dir}" -maxdepth 1 -type f -name "ws-${id}-*.jar" | head -n 1)"
+        title="-"
+        if [ -n "${jar}" ]; then
+            title="${jar##*/}"
+            title="${title#ws-"${id}"-}"
+        fi
+        status="ok"
+        case " ${failed_ids} " in
+            *" ${id} "*) status="failed" ;;
+        esac
+        item_manifest="$(workshop_acf_field "${id}" manifest)"
+        item_time="$(workshop_acf_field "${id}" timeupdated)"
+        printf '%s\t%s\tmanifest=%s\ttimeupdated=%s\tstatus=%s\n' \
+            "${id}" "${title}" "${item_manifest:--}" "${item_time:--}" "${status}" >> "${tmp}"
+    done
+    chmod 600 "${tmp}"
+    if is_root; then
+        chown "${RUN_USER}:${RUN_GROUP}" "${tmp}"
+    fi
+    mv -f "${tmp}" "${manifest}"
+}
+
+fetch_workshop_mods() {
+    if [ -z "${MODS_WORKSHOP_IDS}" ]; then
+        return
+    fi
+
+    dir="$(mods_dir)"
+    content_root="${WORKSHOP_STEAM_DIR}/content/${WORKSHOP_APP_ID}"
+    if [ ! -d "${dir}" ]; then
+        mkdir -p "${dir}"
+        chmod 700 "${dir}"
+        if is_root; then
+            chown "${RUN_USER}:${RUN_GROUP}" "${dir}"
+        fi
+    fi
+
+    echo "Workshop mods: fetching item(s) ${MODS_WORKSHOP_IDS} from app ${WORKSHOP_APP_ID} with an anonymous login..."
+    failed=""
+    for id in ${MODS_WORKSHOP_IDS}; do
+        started="$(date +%s)"
+        log="/tmp/necesse-workshop-${id}.log"
+        # SteamCMD exits 0 even when the download fails, so the success line is the only reliable
+        # signal. Its output is shown as usual, like the app update's.
+        run_as_user steamcmd +login anonymous +workshop_download_item "${WORKSHOP_APP_ID}" "${id}" +quit 2>&1 | tee "${log}" || true
+        # SteamCMD's last line has no newline; start ours on a fresh one.
+        echo
+        if ! grep -q "Success. Downloaded item ${id} to" "${log}"; then
+            reason="$(grep -o "ERROR! Download item ${id} failed ([^)]*)" "${log}" | head -n 1)"
+            reason="${reason#"ERROR! Download item ${id} failed ("}"
+            reason="${reason%)}"
+            rm -f "${log}"
+            echo "Workshop mods: item ${id} failed to download${reason:+ (${reason})}." >&2
+            failed="${failed}${failed:+ }${id}"
+            continue
+        fi
+        rm -f "${log}"
+
+        jar_count="$(find "${content_root}/${id}" -maxdepth 1 -type f -name '*.jar' | wc -l)"
+        if [ "${jar_count}" -ne 1 ]; then
+            echo "Workshop mods: item ${id} downloaded but holds ${jar_count} .jar files where exactly one was expected; not a loadable Necesse mod." >&2
+            failed="${failed}${failed:+ }${id}"
+            continue
+        fi
+        src="$(find "${content_root}/${id}" -maxdepth 1 -type f -name '*.jar')"
+        name="${src##*/}"
+        dest="${dir}/ws-${id}-${name}"
+
+        # The author renamed or re-versioned the jar: drop the managed copy under the old name.
+        for old in "${dir}/ws-${id}-"*.jar; do
+            [ -e "${old}" ] || continue
+            [ "${old}" = "${dest}" ] && continue
+            echo "Workshop mods: item ${id} is now ${name}; removing ${old##*/}."
+            rm -f "${old}"
+        done
+
+        if [ -f "${dest}" ] && cmp -s "${src}" "${dest}"; then
+            echo "Workshop mods: item ${id} unchanged (${dest##*/}), $(( $(date +%s) - started ))s."
+        else
+            tmp="${dest}.tmp.$$"
+            cp "${src}" "${tmp}"
+            chmod 600 "${tmp}"
+            if is_root; then
+                chown "${RUN_USER}:${RUN_GROUP}" "${tmp}"
+            fi
+            mv -f "${tmp}" "${dest}"
+            echo "Workshop mods: item ${id} installed as ${dest##*/}, $(( $(date +%s) - started ))s."
+        fi
+    done
+
+    if [ -n "${failed}" ]; then
+        if mods_fail_fast; then
+            echo "Workshop mods: item(s) ${failed} could not be fetched; refusing to start with a partial mod set (MODS_FAIL_FAST=true). A missing mod changes the server's mods hash and locks every subscribed player out." >&2
+            exit 1
+        fi
+        echo "Workshop mods: WARNING: item(s) ${failed} could not be fetched; starting anyway with what is installed (MODS_FAIL_FAST=false)." >&2
+    fi
+
+    # Managed jars whose id is no longer listed are deleted. Only the ws-<digits>- form is touched.
+    for jar in "${dir}"/ws-*.jar; do
+        [ -e "${jar}" ] || continue
+        base="${jar##*/}"
+        jid="${base#ws-}"
+        jid="${jid%%-*}"
+        case "${jid}" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        case " ${MODS_WORKSHOP_IDS} " in
+            *" ${jid} "*) ;;
+            *)
+                echo "Workshop mods: removing ${base} (item ${jid} is no longer in MODS_WORKSHOP)."
+                rm -f "${jar}"
+                ;;
+        esac
+    done
+
+    write_workshop_manifest "${dir}" "${failed}"
+    echo "Workshop mods: done; see ${dir%/mods}/ws-manifest.txt."
 }
 
 get_manifest_buildid() {
@@ -534,6 +734,8 @@ trap 'handle_exit' INT TERM
 
 adjust_permissions
 resolve_password
+validate_workshop_config
+fetch_workshop_mods
 open_console
 open_output
 main_loop
