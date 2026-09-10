@@ -4,12 +4,51 @@ All notable changes to this project are documented here. The format is based on 
 
 ## [Unreleased]
 
-## [2.3.1] - 2026-09-10
+## [2.4.0] - 2026-09-10
 
-No runtime change: the image built from this tag has the 2.3.0 `Dockerfile` and entrypoint. This
-release is about where the image can be found and how it can be pinned.
+A migration release: someone running a Necesse container from another image can try this one by
+changing the image line, and go back the same way. For everyone else nothing changes: with none of
+the alternative names set and no legacy path mounted, the entrypoint logs exactly what 2.3.0 did.
+`MODS_*` are untouched (the mod surface is frozen at 2.3.0).
+
+Also in this release, from the unreleased 2.3.1 work: the image is published to Docker Hub as
+well as GHCR and carries game-version tags (see below); neither changes the image itself.
 
 ### Added
+- Environment aliases: `WORLD`, `PASSWORD`, `OWNER`, `SLOTS`, `MOTD`, `PAUSE`, `JVMARGS`
+  (brammys-style) and `world`, `password`, `owner`, `slots`, `pauseWhenEmpty`, `giveClientsPower`,
+  `JVM_OPTS` (karyeet-style `server.cfg` keys) fill their canonical variables when those are unset. Each alias used logs one
+  `WARN` naming the canonical variable; when both are set the canonical one wins, with a `WARN`
+  saying so. One data table in `entrypoint.sh` (`ENV_ALIASES`); an alias is one more line. The
+  password aliases follow the 2.1.0 path: written to `cfg/server.cfg`, redacted, removed from the
+  Java environment.
+- Legacy mount shim: each of `/necesse/{saves,logs,cfg,mods}` and
+  `/root/.config/Necesse/{saves,logs,cfg,mods}` that is a mount point (or a directory inside a
+  mounted root) is symlinked into the data directory (`Using <path> for <name> (legacy layout).`),
+  so the game uses the existing files in place; the linked trees are re-owned to `PUID:PGID`. Only
+  symlinks inside the data directory are ever created. If the data directory already holds files
+  under that name the container exits non-zero naming both locations; `LOCAL_DIR=1` together with a
+  legacy mount is refused. `server.cfg`/`banned.cfg` mounted as single files (karyeet-style compose)
+  are adopted too: the directory holding them is linked and the join password is written into the
+  mounted `server.cfg` in place (a file mount cannot be renamed over); if that write fails
+  (read-only mount) the container exits non-zero naming the file rather than run with another
+  password.
+- Password guard for legacy layouts: a shimmed `server.cfg` that already carries a join password
+  while no password variable is set makes the container exit non-zero naming the file, instead of
+  blanking the field and opening the server.
+- World auto-detect: with `WORLD_NAME` (and its aliases) unset, exactly one world under
+  `saves/worlds/` is loaded (`Loading existing world <name> (auto-detected from saves/worlds/).`);
+  none creates `world` as before; several exit non-zero listing them, unless one of them is `world`,
+  which is loaded with a `WARN` (what 2.3.0 did).
+- `console` helper (`/usr/local/bin/console`): `docker exec necesse console players` writes the
+  command to the console FIFO and prints the redacted reply (2 s of silence or 10 s at most,
+  configurable); no arguments prints usage. `redact.sh` keeps the copy it reads,
+  `/tmp/necesse-output.log`, rotated at 1 MiB with one previous file. The FIFO path is unchanged.
+- README "Coming from another image" (andreasgl4ser-style, brammys-style, karyeet-style, Going
+  back) and "Console"; `tests/fixtures/` holds one compose file per source layout and
+  `tests/run-fixtures.sh` exercises them (aliases, shim, safety refusal, log diff against 2.3.0,
+  auto-detect, console, guarantees).
+
 - Docker Hub: every release and weekly rebuild is pushed to `docker.io/stargumbo/necesse-server`
   as well as `ghcr.io/stargumbo/necesse-server`, from one build, so a tag has the same digest on
   both registries. The workflow verifies that after the push and stops before any further tagging
@@ -17,7 +56,7 @@ release is about where the image can be found and how it can be pinned.
   and `DOCKERHUB_TOKEN` repository secrets exist; without them the workflow publishes to GHCR
   exactly as before (`.github/workflows/publish.yml`).
 - Game-version tags: `X.Y.Z-<game>` (never re-pointed), `<game>` and `<game major.minor>`
-  (floating), for example `2.3.1-1.3.3`, `1.3.3` and `1.3`. The game version is read from
+  (floating), for example `2.4.0-1.3.3`, `1.3.3` and `1.3`. The game version is read from
   `Server.jar` inside the image that was just pushed, never hard-coded: `scripts/game-version.py`
   takes the single bare version constant in `necesse/engine/GameInfo.class` and cross-checks it
   against that class's `Version X.Y.Z` string. The weekly rebuild moves the floating game tags only
@@ -28,6 +67,9 @@ release is about where the image can be found and how it can be pinned.
   class layout fails CI on the next push instead of the next release.
 
 ### Changed
+- `WORLD_NAME`, `SERVER_SLOTS`, `PAUSE_WHEN_EMPTY` and `GIVE_CLIENTS_POWER` are no longer image
+  `ENV` defaults; the entrypoint applies the same defaults (`world`, `10`, `0`, `0`) after the
+  aliases, so that an alias can fill them. Effective values and the launch command are unchanged.
 - README: new "Tags" section listing both registries and which tags float; the stale
   `docs/DOCKER_HUB_OVERVIEW.md` now points at the README sync.
 
@@ -165,6 +207,7 @@ First release of the `stargumbo/necesse-server` fork, published as `ghcr.io/star
 ## [1.3.1] - 2025-10-27
 ### Added
 - Image-level healthcheck matching the Compose probe so `docker run` users get liveness status (`Dockerfile`).
+
 ### Changed
 - Compose service now relies on the baked-in healthcheck and enforces memory limits with `mem_limit`/`mem_reservation` so limits work outside Swarm (`docker-compose.yml`).
 - README Compose example mirrors the actual service definition, listing explicit environment variables instead of `env_file` (`README.md`).
@@ -174,6 +217,7 @@ First release of the `stargumbo/necesse-server` fork, published as `ghcr.io/star
 ### Added
 - README badges for CI status, latest release, Docker pulls, and image size.
 - Necesse trailer GIF below the badges.
+
 ### Changed
 - README examples now default to the `latest` image tag and reference the bundled `docker-compose.yml` / `.env.example`.
 
@@ -184,6 +228,7 @@ First release of the `stargumbo/necesse-server` fork, published as `ghcr.io/star
 ## [1.1.0] - 2025-10-22
 ### Added
 - GitHub Actions publishes Docker images to Docker Hub (`andreasgl4ser/necesse-server`) on tagged releases.
+
 ### Changed
 - `docker-compose.yml` now defaults to the published Docker Hub image and accepts an optional `IMAGE_TAG`.
 - README refocused on Docker Hub workflows with updated quickstart examples.
@@ -191,6 +236,7 @@ First release of the `stargumbo/necesse-server` fork, published as `ghcr.io/star
 ## [1.0.0] - 2025-10-22
 ### Added
 - Automatic update watcher controlled by `AUTO_UPDATE_INTERVAL_MINUTES` that checks Steam for new builds and restarts the server.
+
 ### Changed
 - Reworked README for server admins with clearer quickstart, management guidance, and streamlined feature notes.
 - Auto-update now logs when periodic checks are enabled so admins know the cadence.

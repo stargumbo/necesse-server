@@ -35,6 +35,10 @@ This is a fork of [andreas-glaser/necesse-docker-server](https://github.com/andr
   `data/mods`; edit the collection in Steam and restart the container to change mods. Players
   subscribe to the collection. `MODS_WORKSHOP=<id>,<id>` is the explicit-list alternative. See
   Workshop mods below.
+- **Works with volumes and variable names from other Necesse images.** brammys-style and
+  karyeet-style mounts are used in place, their environment names are accepted as aliases, a single
+  existing world is picked up by name, and `docker exec necesse console players` replaces
+  `docker attach`. See Coming from another image.
 - **amd64 only.**
 
 ---
@@ -123,18 +127,109 @@ Each release `vX.Y.Z` of this image is built against one Necesse version, `<game
 | --- | --- | --- | --- |
 | `X` | `2` | newest image of that major (**recommended pin**) | every release and weekly rebuild within the major |
 | `X.Y` | `2.3` | newest image of that minor | every patch release and weekly rebuild within the minor |
-| `X.Y.Z` | `2.3.1` | that release | the weekly rebuild, while it is the newest release (same code, refreshed base image and Steam build) |
+| `X.Y.Z` | `2.4.0` | that release | the weekly rebuild, while it is the newest release (same code, refreshed base image and Steam build) |
 | `latest` | `latest` | newest image | every release and weekly rebuild |
 | `<game>` | `1.3.3` | newest image built for that game version | every release built for that game version; a weekly rebuild only when the game version changed |
 | `<game major.minor>` | `1.3` | newest image built for that game minor | same rule as `<game>` |
-| `X.Y.Z-<game>` | `2.3.1-1.3.3` | exactly one image, forever | never |
+| `X.Y.Z-<game>` | `2.4.0-1.3.3` | exactly one image, forever | never |
 
 So `2` follows fixes and rebuilds without breaking changes, `1.3.3` follows the newest image that
-runs that game version, and `2.3.1-1.3.3` is the fully immutable pin. The weekly rebuild
+runs that game version, and `2.4.0-1.3.3` is the fully immutable pin. The weekly rebuild
 (Mondays, 05:17 UTC) exists so that the SteamCMD base image and the Steam server build stay
 current between releases; when Steam ships a new game version, the rebuild publishes new
 `<game>` tags for it and the previous `<game>` tags keep pointing at the last image built for the
 previous version.
+
+---
+
+## Coming from another image
+
+The image line is meant to be the only thing you change. Keep your volumes and your environment:
+the entrypoint recognises the common layouts and variable names, says what it did in the first
+lines of `docker logs`, and refuses to start rather than guess whenever two things could be meant.
+Add `stop_grace_period: 60s` (Compose) or `--stop-timeout 60` (`docker run`) if your file does not
+have it: this image saves the world on stop and needs the time.
+
+Whichever image you come from, this image's own data directory, `/home/necesse/.config/Necesse`,
+exists as well. It holds the game's `cache/` and `latest-server-log.txt` and, with Workshop mods
+enabled, `ws-manifest.txt` and `ws-collection.txt`. Without a mount for it they live in an
+anonymous Docker volume and are lost on a recreate, which costs nothing but the Workshop
+last-known-good cache; mount `./data:/home/necesse/.config/Necesse` next to your existing volumes
+if you want them kept.
+
+### andreasgl4ser-style
+
+Same data directory, same environment variables. Change `image:` to
+`ghcr.io/stargumbo/necesse-server:2` (or `stargumbo/necesse-server:2`) and recreate the container.
+From then on the join password lives in `cfg/server.cfg` (mode 0600) instead of the command line;
+see Secrets. [`tests/fixtures/andreasgl4ser-style.yml`](tests/fixtures/andreasgl4ser-style.yml) is
+such a compose file.
+
+### brammys-style
+
+Layout `/necesse/saves`, `/necesse/logs`, `/necesse/cfg` (and `/necesse/mods`); environment
+`WORLD`, `PASSWORD`, `OWNER`, `SLOTS`, `MOTD`, `PAUSE`, `GIVE_CLIENTS_POWER`.
+
+- **Keep your volumes.** Each mounted `/necesse/<name>` is linked into this image's data directory
+  at start (`Using /necesse/saves for saves (legacy layout).` in the log, one line per path). The
+  game reads and writes your files where they are; nothing is moved or copied. If the data
+  directory already holds files under the same name the container exits instead, naming both
+  locations.
+- **Optionally rename the environment.** The names above are accepted as aliases, each one used
+  logging one `WARN` that names the canonical variable: `WORLD` -> `WORLD_NAME`, `PASSWORD` ->
+  `SERVER_PASSWORD`, `OWNER` -> `SERVER_OWNER`, `SLOTS` -> `SERVER_SLOTS`, `MOTD` -> `SERVER_MOTD`,
+  `PAUSE` -> `PAUSE_WHEN_EMPTY` (`GIVE_CLIENTS_POWER` is the same name). When both are set the
+  canonical one wins. `JVMARGS` -> `JAVA_OPTS` the same way. `LOGGING` and `ZIP` have no alias: use
+  `ENABLE_LOGGING` and `ZIP_SAVES` (the defaults match).
+- **World.** With `WORLD` unset, the single world under `saves/worlds/` is loaded and logged
+  (`Loading existing world <name> (auto-detected from saves/worlds/).`); with several, set
+  `WORLD_NAME`.
+- **Password.** `PASSWORD` is written into `cfg/server.cfg` (0600) and no longer appears on the
+  command line or in `docker logs`; see Secrets.
+
+[`tests/fixtures/brammys-style.yml`](tests/fixtures/brammys-style.yml) is such a compose file with
+only the image line changed.
+
+### karyeet-style
+
+Layout `/root/.config/Necesse/{saves,logs,cfg,mods}` with root-owned files; environment in
+`server.cfg` key names (`world`, `slots`, `password`, `pauseWhenEmpty`, `giveClientsPower`, `owner`,
+`MOTD`, ...); console through `docker attach`.
+
+- **Keep your volumes**, as above, including `server.cfg` and `banned.cfg` mounted as **single
+  files** (`./server.cfg:/root/.config/Necesse/cfg/server.cfg`): the directory holding them is
+  linked in and the log says so (`... for cfg (legacy layout; server.cfg is a file mount, written in
+  place).`). The join password is written into that mounted `server.cfg` in place, because a file
+  mount cannot be replaced, so the file must be writable: mounted read-only, the container refuses
+  to start and names the file, rather than run with a password other than the configured one.
+  Mounting the directory instead (`./cfg:/root/.config/Necesse/cfg`) works as well.
+- **Your password stays a password.** If the legacy `server.cfg` already carries a join password and
+  no password variable is set here (`password`, `PASSWORD`, `SERVER_PASSWORD`,
+  `SERVER_PASSWORD_FILE`), the container refuses to start instead of blanking the field and opening
+  the server. Set `SERVER_PASSWORD` (to the same or a new password), or blank the field yourself to
+  run open on purpose. This applies to every legacy layout.
+- **`PUID` / `PGID`.** The server runs as an unprivileged user here, so the mounted files are
+  re-owned to `PUID:PGID` (default `1000:1000`) at start. Set them to the ids the files should end
+  up with.
+- **Environment.** `world`, `slots`, `password`, `pauseWhenEmpty`, `giveClientsPower`, `owner`,
+  `MOTD` and `JVM_OPTS` are accepted as aliases (one `WARN` each naming the canonical variable). The
+  other keys (`port`, `language`, `zipSaves`, `maxClientLatencySeconds`, ...) are not read from the
+  environment here: they stay in your `server.cfg`, which is used as it is.
+- **Console.** Instead of `docker attach`, `docker exec necesse_server console players` types the
+  command and prints the reply (see Console below).
+
+[`tests/fixtures/karyeet-style-file-cfg.yml`](tests/fixtures/karyeet-style-file-cfg.yml) is such a
+compose file with only the image line changed;
+[`tests/fixtures/karyeet-style.yml`](tests/fixtures/karyeet-style.yml) is the same with `cfg`
+mounted as a directory.
+
+### Going back
+
+Nothing is converted. World, logs, cfg and mods stay in your original directories in the game's own
+format; the data directory only gained symlinks, which no other image looks at. Change the image
+line back and recreate the container. One thing to know: `cfg/server.cfg` now carries the join
+password in its `password` field (that is where this image keeps it), and the files this image
+wrote are mode 0600.
 
 <!-- docker-hub-overview-ends-here -->
 
@@ -284,7 +379,7 @@ menu should match the server's. What to expect:
 
 | Variable | Purpose |
 | --- | --- |
-| `WORLD_NAME` | World to load or create. |
+| `WORLD_NAME` | World to load or create. Unset: the single world under `saves/worlds/` is loaded; none there creates `world`; several make the container exit listing them (unless one is `world`, which is then loaded with a warning). |
 | `SERVER_PASSWORD` | Join password; blank disables. Written into `cfg/server.cfg`, never passed on the command line (see Secrets). |
 | `SERVER_PASSWORD_FILE` | Path of a file holding the password (first line), e.g. a Docker secret. Wins over `SERVER_PASSWORD`. Missing/unreadable/empty file = container exits. |
 | `SERVER_SLOTS` | Maximum concurrent players (1–250). |
@@ -311,6 +406,7 @@ menu should match the server's. What to expect:
 | `STOP_TIMEOUT_SECONDS` | How long the entrypoint waits for the server to exit after typing `stop` before falling back to `SIGTERM` (default `50`; keep it below the container's stop grace period). |
 | `PUID` / `PGID` | Host UID/GID to chown the bind mount to. The entrypoint remaps the `necesse` user before launching the JVM. |
 | `IMAGE_TAG` | Override image tag in Compose (default `latest`). |
+| Aliases | `WORLD`, `PASSWORD`, `OWNER`, `SLOTS`, `MOTD`, `PAUSE`, `JVMARGS` and `world`, `password`, `owner`, `slots`, `pauseWhenEmpty`, `giveClientsPower`, `JVM_OPTS` fill the canonical variables above when those are unset, one `WARN` per alias used; see Coming from another image. |
 
 ---
 
@@ -325,6 +421,18 @@ menu should match the server's. What to expect:
 - Health check: `pgrep -f 'Server.jar'`. Use `docker compose ps` or
   `docker inspect --format '{{.State.Health.Status}}' necesse` to verify.
 - Tail logs with `docker compose logs -f necesse` or from `data/logs/`.
+
+### Console
+
+`docker exec necesse console <command>` types a command into the running server's console and
+prints the reply: `docker exec necesse console players` answers `Players online: 0/10`;
+`console help` lists the server's commands. It writes to the FIFO the entrypoint holds open as the
+server's stdin (`/tmp/necesse-console`; `docker exec necesse sh -c 'echo players > /tmp/necesse-console'`
+keeps working) and reads the reply from the redacted copy of the server output that `redact.sh`
+keeps in `/tmp/necesse-output.log` (rotated at 1 MiB), so the join password never shows up there
+either. It returns after 2 s of silence or 10 s at most (`CONSOLE_QUIET_SECONDS`,
+`CONSOLE_TIMEOUT_SECONDS`); with no arguments it prints usage. Run it as the container's default
+user (no `-u`).
 
 ### Graceful stop
 
