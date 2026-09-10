@@ -1,0 +1,24 @@
+# A compose file as written for the brammys-style image, with only the image line changed
+# (and stop_grace_period added, the one addition this README recommends: the server saves on stop).
+#
+# Layout: the game's -localdir tree under /necesse, mounted per directory. Env names MOTD, PASSWORD,
+# SLOTS, PAUSE (also WORLD, OWNER, GIVE_CLIENTS_POWER) are accepted as aliases; each one used logs one
+# WARN line naming the canonical variable. The existing world under ./necesse/saves/worlds/ is
+# auto-detected when WORLD is not set.
+services:
+  necesse-server:
+    image: ${IMAGE:-ghcr.io/stargumbo/necesse-server:2}
+    container_name: necesse-server
+    restart: always
+    stop_grace_period: 60s
+    ports:
+      - "14159:14159/udp"
+    environment:
+      - MOTD=Your own custom message of today!
+      - PASSWORD=${PASSWORD:-strong_pass}
+      - SLOTS=25
+      - PAUSE=1
+    volumes:
+      - ./necesse/saves:/necesse/saves
+      - ./necesse/logs:/necesse/logs
+      - ./necesse/cfg:/necesse/cfg

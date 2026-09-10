@@ -18,6 +18,8 @@ AUTO_UPDATE_FLAG_FILE="/tmp/necesse-auto-update"
 CONSOLE_FIFO="/tmp/necesse-console"
 # The server's stdout/stderr go through a second FIFO into redact.sh, which replaces the join
 # password with **** before anything reaches the container log (the game prints it on start).
+# redact.sh also keeps a rotated copy of that output in /tmp/necesse-output.log, which the
+# `console` helper (docker exec <container> console players) reads to show a command's reply.
 OUTPUT_FIFO="/tmp/necesse-output"
 STOP_TIMEOUT_SECONDS="${STOP_TIMEOUT_SECONDS:-50}"
 # Steam Workshop items are published under the client app id, not the dedicated server's.
@@ -71,6 +73,213 @@ adjust_permissions() {
         "${APP_DIR}" \
         "${RUN_HOME}" \
         "${STEAMCMD_DIR}"
+}
+
+# The game's data directory as launch_server passes it: DATA_DIR when set, else the run user's default.
+data_dir() {
+    if [ -n "${DATA_DIR:-}" ]; then
+        printf '%s' "${DATA_DIR}"
+    else
+        printf '%s' "${RUN_HOME}/.config/Necesse"
+    fi
+}
+
+# --- Environment aliases (2.4.0) --------------------------------------------------------------
+# Variable names other Necesse images use for the same settings, accepted so that a compose file
+# written for one of them works here after changing only the image line: brammys-style upper-case
+# names and karyeet-style server.cfg key names. One `alias=canonical` per line; adding an alias is
+# one more line. The canonical variable always wins, and an alias that is used produces exactly one
+# warning naming the canonical variable. Keys with no counterpart here (karyeet-style `language`,
+# `zipSaves`, `port`, ...) are not listed: they live in server.cfg, which carries over untouched.
+ENV_ALIASES="
+WORLD=WORLD_NAME
+PASSWORD=SERVER_PASSWORD
+OWNER=SERVER_OWNER
+SLOTS=SERVER_SLOTS
+MOTD=SERVER_MOTD
+PAUSE=PAUSE_WHEN_EMPTY
+world=WORLD_NAME
+password=SERVER_PASSWORD
+owner=SERVER_OWNER
+slots=SERVER_SLOTS
+pauseWhenEmpty=PAUSE_WHEN_EMPTY
+giveClientsPower=GIVE_CLIENTS_POWER
+"
+
+apply_env_aliases() {
+    for pair in ${ENV_ALIASES}; do
+        alias_name="${pair%%=*}"
+        canonical="${pair#*=}"
+        eval "alias_value=\${${alias_name}:-}"
+        [ -n "${alias_value}" ] || continue
+        eval "canonical_value=\${${canonical}:-}"
+        if [ -n "${canonical_value}" ]; then
+            echo "WARN: ${alias_name} and ${canonical} are both set; ${canonical} wins and ${alias_name} is ignored." >&2
+        else
+            echo "WARN: ${alias_name} is accepted as an alias of ${canonical} (for compose files written for another image); set ${canonical} instead." >&2
+            export "${canonical}=${alias_value}"
+        fi
+    done
+}
+
+# Defaults that were image ENV values before 2.4.0. They are applied here, after the aliases, because
+# inside the container an image default is indistinguishable from an operator's choice, and the
+# aliases must be able to fill a variable the image would otherwise have pre-set.
+apply_defaults() {
+    SERVER_SLOTS="${SERVER_SLOTS:-10}"
+    PAUSE_WHEN_EMPTY="${PAUSE_WHEN_EMPTY:-0}"
+    GIVE_CLIENTS_POWER="${GIVE_CLIENTS_POWER:-0}"
+    export SERVER_SLOTS PAUSE_WHEN_EMPTY GIVE_CLIENTS_POWER
+}
+
+# --- Legacy volume layouts (2.4.0) --------------------------------------------------------------
+# Other images keep the game's data under another root: brammys-style /necesse/{saves,logs,cfg,mods}
+# (the game's -localdir layout) and karyeet-style /root/.config/Necesse/{saves,logs,cfg,mods} (root's
+# default data directory). Someone switching to this image keeps those volumes and changes only the
+# image line: every legacy path that is a bind mount (or a directory inside a mounted legacy root) is
+# linked into this image's data directory, so the game reads and writes the existing files where they
+# are. The shim only ever creates symlinks inside the data directory; it never moves, copies or deletes
+# a file, and a data-directory entry that already holds files makes the container refuse to start
+# rather than guess which copy is the real one. With no legacy path mounted, nothing happens.
+LEGACY_LAYOUT_ROOTS="/necesse /root/.config/Necesse"
+LEGACY_LAYOUT_NAMES="saves logs cfg mods"
+SHIMMED_PATHS=""
+
+is_mount_point() {
+    # Field 5 of /proc/self/mountinfo is the mount point. The paths checked here contain no spaces,
+    # so the file's octal escaping does not come into play.
+    awk -v path="$1" '$5 == path { found = 1 } END { exit !found }' /proc/self/mountinfo
+}
+
+dir_is_empty() {
+    [ -z "$(find "$1" -mindepth 1 -maxdepth 1 2>/dev/null | head -n 1)" ]
+}
+
+# The run user must be able to search every ancestor of a linked path, and /root, the karyeet-style
+# root, is mode 0700 in the image (the game then fails with "Could not create folder for file").
+# Search permission only (o+x); nothing is made readable.
+make_traversable() {
+    p="$(dirname "$1")"
+    while [ "${p}" != "/" ]; do
+        chmod o+x "${p}"
+        p="$(dirname "${p}")"
+    done
+}
+
+link_legacy_mounts() {
+    datadir="$(data_dir)"
+    local_dir_flag="$(lowercase "${LOCAL_DIR:-0}")"
+    for root in ${LEGACY_LAYOUT_ROOTS}; do
+        root_mounted=0
+        if is_mount_point "${root}"; then
+            root_mounted=1
+        fi
+        for name in ${LEGACY_LAYOUT_NAMES}; do
+            legacy="${root}/${name}"
+            if is_mount_point "${legacy}"; then
+                :
+            elif [ "${root_mounted}" -eq 1 ] && [ -d "${legacy}" ]; then
+                :
+            else
+                # karyeet-style compose files mount server.cfg and banned.cfg as single files inside cfg/.
+                if [ "${name}" = "cfg" ] && { is_mount_point "${legacy}/server.cfg" || is_mount_point "${legacy}/banned.cfg"; }; then
+                    echo "WARN: ${legacy}/server.cfg and/or banned.cfg are mounted as single files. This image cannot adopt a file mount in place (the join password is written into server.cfg with an atomic rename, which a file mount does not permit), so those two files are not used and the server starts from this image's own cfg/. To keep them, mount the directory instead: ./cfg:${legacy} (see README, Coming from another image)." >&2
+                fi
+                continue
+            fi
+            if [ "${local_dir_flag}" = "1" ] || [ "${local_dir_flag}" = "true" ]; then
+                echo "${legacy} is mounted, but LOCAL_DIR=1 keeps the game's data inside the image at ${APP_DIR}; unset LOCAL_DIR to use the mounted directories. Refusing to start." >&2
+                exit 1
+            fi
+            target="${datadir}/${name}"
+            if is_root; then
+                make_traversable "${legacy}"
+            fi
+            if [ -L "${target}" ]; then
+                if [ "$(readlink "${target}")" = "${legacy}" ]; then
+                    echo "Using ${legacy} for ${name} (legacy layout)."
+                    SHIMMED_PATHS="${SHIMMED_PATHS} ${legacy}"
+                    continue
+                fi
+                echo "${target} is already a symlink to $(readlink "${target}"), not to the mounted ${legacy}; refusing to guess which one is meant. Remove the link or the mount. Refusing to start." >&2
+                exit 1
+            fi
+            if [ -e "${target}" ]; then
+                if [ -d "${target}" ] && dir_is_empty "${target}"; then
+                    rmdir "${target}"
+                else
+                    echo "Both ${legacy} (mounted, legacy layout) and ${target} (this image's data directory) hold files for ${name}; refusing to start rather than pick one. Keep exactly one of them: remove the ${legacy} mount, or move the contents of ${target} out of the data directory. Nothing was changed." >&2
+                    exit 1
+                fi
+            fi
+            if [ ! -d "${datadir}" ]; then
+                mkdir -p "${datadir}"
+                if is_root; then
+                    chown "${RUN_USER}:${RUN_GROUP}" "${datadir}"
+                fi
+            fi
+            ln -s "${legacy}" "${target}"
+            if is_root; then
+                chown -h "${RUN_USER}:${RUN_GROUP}" "${target}"
+            fi
+            echo "Using ${legacy} for ${name} (legacy layout)."
+            SHIMMED_PATHS="${SHIMMED_PATHS} ${legacy}"
+        done
+    done
+    # PUID/PGID remap: adjust_permissions' chown -R does not follow symlinks, so the linked trees
+    # (root-owned in a karyeet-style setup) are re-owned here.
+    if is_root && [ -n "${SHIMMED_PATHS}" ]; then
+        # shellcheck disable=SC2086
+        chown -R "${RUN_USER}:${RUN_GROUP}" ${SHIMMED_PATHS}
+    fi
+}
+
+# --- World auto-detect (2.4.0) ------------------------------------------------------------------
+# With WORLD_NAME (and its aliases) unset, the world to load is taken from what is already in
+# saves/worlds/, which after the shim includes a legacy layout's saves: exactly one world -> load it;
+# none -> the image's long-standing default name "world" (a new world, as before); several -> refuse
+# and list them, unless one of them is "world", which is what earlier releases would have loaded.
+detect_world() {
+    if [ -n "${WORLD_NAME:-}" ]; then
+        return
+    fi
+    worlds_dir="$(data_dir)/saves/worlds"
+    found=""
+    count=0
+    if [ -d "${worlds_dir}" ]; then
+        for entry in "${worlds_dir}"/*.zip "${worlds_dir}"/*/; do
+            [ -e "${entry}" ] || continue
+            world="${entry%/}"
+            world="${world##*/}"
+            world="${world%.zip}"
+            if printf '%s\n' "${found}" | grep -Fxq "${world}"; then
+                continue
+            fi
+            found="${found}${found:+
+}${world}"
+            count=$((count + 1))
+        done
+    fi
+    case "${count}" in
+        0)
+            WORLD_NAME="world"
+            ;;
+        1)
+            WORLD_NAME="${found}"
+            echo "Loading existing world ${WORLD_NAME} (auto-detected from saves/worlds/)."
+            ;;
+        *)
+            listed="$(printf '%s\n' "${found}" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+            if printf '%s\n' "${found}" | grep -Fxq "world"; then
+                WORLD_NAME="world"
+                echo "WARN: WORLD_NAME is not set and saves/worlds/ holds several worlds (${listed}); loading 'world', the default name, as earlier releases did. Set WORLD_NAME to choose another." >&2
+            else
+                echo "WORLD_NAME is not set and saves/worlds/ holds more than one world: ${listed}. Set WORLD_NAME to the one to load; refusing to guess." >&2
+                exit 1
+            fi
+            ;;
+    esac
+    export WORLD_NAME
 }
 
 # --- Join password ---------------------------------------------------------------------------
@@ -792,14 +1001,15 @@ launch_server() {
     printf '\n\n'
 
     # stdin: the console FIFO. stdout/stderr: the output FIFO feeding redact.sh. umask 077 makes
-    # every file the game creates (logs, saves, cfg) 0600. The password variables are dropped from
-    # the environment, and the child closes fds 3/4 so it holds neither FIFO's spare end.
+    # every file the game creates (logs, saves, cfg) 0600. The password variables (and their
+    # aliases) are dropped from the environment, and the child closes fds 3/4 so it holds neither
+    # FIFO's spare end.
     (
         umask 077
         if is_root; then
-            exec gosu "${RUN_USER}:${RUN_GROUP}" env -u SERVER_PASSWORD -u SERVER_PASSWORD_FILE HOME="${RUN_HOME}" "$@"
+            exec gosu "${RUN_USER}:${RUN_GROUP}" env -u SERVER_PASSWORD -u SERVER_PASSWORD_FILE -u PASSWORD -u password HOME="${RUN_HOME}" "$@"
         else
-            exec env -u SERVER_PASSWORD -u SERVER_PASSWORD_FILE "$@"
+            exec env -u SERVER_PASSWORD -u SERVER_PASSWORD_FILE -u PASSWORD -u password "$@"
         fi
     ) <&3 >"${OUTPUT_FIFO}" 2>&1 3>&- 4>&- &
     SERVER_PID=$!
@@ -875,7 +1085,11 @@ main_loop() {
 
 trap 'handle_exit' INT TERM
 
+apply_env_aliases
+apply_defaults
 adjust_permissions
+link_legacy_mounts
+detect_world
 resolve_password
 validate_workshop_config
 resolve_workshop_collection

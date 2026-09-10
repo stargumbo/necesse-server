@@ -4,6 +4,47 @@ All notable changes to this project are documented here. The format is based on 
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-09-10
+
+A migration release: someone running a Necesse container from another image can try this one by
+changing the image line, and go back the same way. For everyone else nothing changes: with none of
+the alternative names set and no legacy path mounted, the entrypoint logs exactly what 2.3.0 did.
+`MODS_*` are untouched (the mod surface is frozen at 2.3.0).
+
+### Added
+- Environment aliases: `WORLD`, `PASSWORD`, `OWNER`, `SLOTS`, `MOTD`, `PAUSE` (brammys-style) and
+  `world`, `password`, `owner`, `slots`, `pauseWhenEmpty`, `giveClientsPower` (karyeet-style
+  `server.cfg` keys) fill their canonical variables when those are unset. Each alias used logs one
+  `WARN` naming the canonical variable; when both are set the canonical one wins, with a `WARN`
+  saying so. One data table in `entrypoint.sh` (`ENV_ALIASES`); an alias is one more line. The
+  password aliases follow the 2.1.0 path: written to `cfg/server.cfg`, redacted, removed from the
+  Java environment.
+- Legacy mount shim: each of `/necesse/{saves,logs,cfg,mods}` and
+  `/root/.config/Necesse/{saves,logs,cfg,mods}` that is a mount point (or a directory inside a
+  mounted root) is symlinked into the data directory (`Using <path> for <name> (legacy layout).`),
+  so the game uses the existing files in place; the linked trees are re-owned to `PUID:PGID`. Only
+  symlinks inside the data directory are ever created. If the data directory already holds files
+  under that name the container exits non-zero naming both locations; `LOCAL_DIR=1` together with a
+  legacy mount is refused. `server.cfg`/`banned.cfg` mounted as single files (karyeet-style compose)
+  are not adopted: a `WARN` says so and names the directory mount to use instead.
+- World auto-detect: with `WORLD_NAME` (and its aliases) unset, exactly one world under
+  `saves/worlds/` is loaded (`Loading existing world <name> (auto-detected from saves/worlds/).`);
+  none creates `world` as before; several exit non-zero listing them, unless one of them is `world`,
+  which is loaded with a `WARN` (what 2.3.0 did).
+- `console` helper (`/usr/local/bin/console`): `docker exec necesse console players` writes the
+  command to the console FIFO and prints the redacted reply (2 s of silence or 10 s at most,
+  configurable); no arguments prints usage. `redact.sh` keeps the copy it reads,
+  `/tmp/necesse-output.log`, rotated at 1 MiB with one previous file. The FIFO path is unchanged.
+- README "Coming from another image" (andreasgl4ser-style, brammys-style, karyeet-style, Going
+  back) and "Console"; `tests/fixtures/` holds one compose file per source layout and
+  `tests/run-fixtures.sh` exercises them (aliases, shim, safety refusal, log diff against 2.3.0,
+  auto-detect, console, guarantees).
+
+### Changed
+- `WORLD_NAME`, `SERVER_SLOTS`, `PAUSE_WHEN_EMPTY` and `GIVE_CLIENTS_POWER` are no longer image
+  `ENV` defaults; the entrypoint applies the same defaults (`world`, `10`, `0`, `0`) after the
+  aliases, so that an alias can fill them. Effective values and the launch command are unchanged.
+
 ## [2.3.1] - 2026-09-10
 
 No runtime change: the image built from this tag has the 2.3.0 `Dockerfile` and entrypoint. This

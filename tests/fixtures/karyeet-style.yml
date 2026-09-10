@@ -1,0 +1,37 @@
+# A compose file as written for the karyeet-style image, with the image line changed and the two
+# single-file cfg mounts (./server.cfg, ./banned.cfg) replaced by one directory mount, ./cfg, holding
+# the same two files (see README, Coming from another image: a file mount cannot be adopted in place).
+# stop_grace_period is added because the server saves on stop.
+#
+# Layout: root's default data directory /root/.config/Necesse, mounted per directory, files owned by
+# root. The lower-case server.cfg key names (world, slots, password, pauseWhenEmpty, giveClientsPower,
+# owner, MOTD) are accepted as aliases; the other keys stay in server.cfg, which carries over. PUID/PGID
+# re-own the mounted files to the given ids; the `console` helper replaces `docker attach`.
+services:
+  necesse_server:
+    image: ${IMAGE:-ghcr.io/stargumbo/necesse-server:2}
+    container_name: necesse_server
+    restart: unless-stopped
+    stop_grace_period: 60s
+    ports:
+      - "14159:14159/udp"
+    volumes:
+      - ./cfg:/root/.config/Necesse/cfg
+      - ./saves:/root/.config/Necesse/saves
+      - ./logs:/root/.config/Necesse/logs
+      - ./mods:/root/.config/Necesse/mods
+    environment:
+      - world=${WORLD:-myNewWorld}
+      - port=14159
+      - slots=10
+      - password=${PASSWORD:-}
+      - maxClientLatencySeconds=30
+      - pauseWhenEmpty=true
+      - giveClientsPower=true
+      - logging=true
+      - language=en
+      - zipSaves=true
+      - MOTD=
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - MODS_COLLECTION=${MODS_COLLECTION:-}

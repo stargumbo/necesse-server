@@ -1,0 +1,31 @@
+# A compose file as written for the upstream andreasgl4ser/necesse-server image, with only the image
+# line changed. Same data directory, same environment contract: nothing else to do. (stop_grace_period
+# is the one recommended addition, because this image saves the world on stop.)
+services:
+  necesse:
+    image: ${IMAGE:-ghcr.io/stargumbo/necesse-server:2}
+    container_name: necesse
+    restart: unless-stopped
+    stop_grace_period: 60s
+    ports:
+      - "14159:14159/udp"
+    environment:
+      - SERVER_PORT=14159
+      - WORLD_NAME=${WORLD_NAME:-MyWorld}
+      - SERVER_PASSWORD=${PASSWORD:-}
+      - SERVER_SLOTS=10
+      - SERVER_OWNER=
+      - SERVER_MOTD=
+      - PAUSE_WHEN_EMPTY=0
+      - GIVE_CLIENTS_POWER=0
+      - ENABLE_LOGGING=1
+      - ZIP_SAVES=1
+      - SERVER_LANGUAGE=en
+      - UPDATE_ON_START=false
+      - AUTO_UPDATE_INTERVAL_MINUTES=0
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+    volumes:
+      - ./data:/home/necesse/.config/Necesse
+    mem_limit: 2g
+    mem_reservation: 512m

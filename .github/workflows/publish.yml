@@ -46,6 +46,9 @@ jobs:
         id: ref
         run: |
           set -euo pipefail
+          # The helper is taken from the ref this workflow runs from, not from the tag being built: a
+          # scheduled rebuild checks out an older tag below, which may predate it.
+          cp scripts/game-version.py "${RUNNER_TEMP}/game-version.py"
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             tag="${GITHUB_REF_NAME}"
           else
@@ -146,7 +149,7 @@ jobs:
           cid="$(docker create "${ref}")"
           docker cp "${cid}:/app/Server.jar" ./Server.jar
           docker rm "${cid}" >/dev/null
-          game="$(python3 scripts/game-version.py ./Server.jar)"
+          game="$(python3 "${RUNNER_TEMP}/game-version.py" ./Server.jar)"
           rm -f ./Server.jar
           case "${game}" in
             *.*.*) minor="${game%.*}" ;;

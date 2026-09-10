@@ -30,6 +30,8 @@ RUN gosu necesse env HOME=/home/necesse sh -c ' \
    && test -x /app/jre/bin/java && test -f /app/Server.jar'
 
 COPY --chown=necesse:necesse --chmod=755 entrypoint.sh redact.sh /app/
+# `docker exec <container> console players`: types a command into the server console and prints the reply.
+COPY --chmod=755 console.sh /usr/local/bin/console
 WORKDIR /app
 
 LABEL org.opencontainers.image.title="Necesse Dedicated Server" \
@@ -40,10 +42,12 @@ LABEL org.opencontainers.image.title="Necesse Dedicated Server" \
       org.opencontainers.image.revision="${BUILD_REVISION}"
 
 # Runtime identity and server defaults (all overridable at run time; see README). SERVER_PASSWORD is
-# deliberately not defaulted here: pass it at run time only.
+# deliberately not defaulted here: pass it at run time only. WORLD_NAME, SERVER_SLOTS, PAUSE_WHEN_EMPTY
+# and GIVE_CLIENTS_POWER are defaulted by the entrypoint instead (world / 10 / 0 / 0) after the 2.4.0
+# environment aliases are applied, so that an alias such as SLOTS or pauseWhenEmpty can fill them.
 ENV CONTAINER_USER=necesse CONTAINER_GROUP=necesse CONTAINER_UID=${uid} CONTAINER_GID=${gid} \
-    WORLD_NAME=world SERVER_PORT=14159 SERVER_SLOTS=10 SERVER_OWNER= SERVER_MOTD= \
-    PAUSE_WHEN_EMPTY=0 GIVE_CLIENTS_POWER=0 ENABLE_LOGGING=1 ZIP_SAVES=1 SERVER_LANGUAGE=en \
+    WORLD_NAME= SERVER_PORT=14159 SERVER_SLOTS= SERVER_OWNER= SERVER_MOTD= \
+    PAUSE_WHEN_EMPTY= GIVE_CLIENTS_POWER= ENABLE_LOGGING=1 ZIP_SAVES=1 SERVER_LANGUAGE=en \
     SETTINGS_FILE= BIND_IP= MAX_CLIENT_LATENCY= LOCAL_DIR=0 DATA_DIR= LOGS_DIR= \
     UPDATE_ON_START=false AUTO_UPDATE_INTERVAL_MINUTES=0 JAVA_OPTS= \
     MODS_COLLECTION= MODS_WORKSHOP= MODS_FAIL_FAST=true
