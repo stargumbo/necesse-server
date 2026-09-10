@@ -25,7 +25,7 @@ services:
     ports: ["14159:14159/udp"]
     environment:
       WORLD_NAME: MyWorld
-      SERVER_PASSWORD: changeme
+      SERVER_PASSWORD: changeme   # never appears in the logs
     volumes: ["./data:/home/necesse/.config/Necesse"]
 ```
 
@@ -34,10 +34,9 @@ docker compose up -d
 ```
 
 The first start downloads the server from Steam, which takes a minute or two.
-`docker compose logs -f` shows the progress and ends with
-`Started server ... with password "****"`: the password stays in a file that only the server
-can read and never appears in the logs. Your world, config and logs live in `./data`. The same
-image is on Docker Hub as `stargumbo/necesse-server:2`.
+`docker compose logs -f` shows the progress and ends with `Started server ...`. Your world,
+config and logs live in `./data`. The same image is on Docker Hub as
+`stargumbo/necesse-server:2`.
 
 ## Your world is safe
 
@@ -61,18 +60,17 @@ Steam takes care of their side.
 
 ## Stays current
 
-The server checks Steam for a new game build on every start, and with
-`AUTO_UPDATE_INTERVAL_MINUTES` set it also does so while running, saving the world before it
-restarts. The image itself is rebuilt every Monday so the base image and the Steam server build
-stay fresh, and `docker compose pull` picks that up. Pick the tag that matches how much you want
-to move:
+The image is rebuilt every Monday so the base image and the Steam server build stay fresh, and
+`docker compose pull` picks that up. The server also checks Steam for a new game build on every
+start, and with `AUTO_UPDATE_INTERVAL_MINUTES` set it does so while running too, saving the
+world before it restarts. Pick the tag that matches how much you want to move:
 
 | Tag | Use it when |
 | --- | --- |
 | `2` | you want fixes and rebuilds without breaking changes (recommended) |
+| `2.4.0-1.3.3` | you want a pin that **never moves** |
 | `2.4.0` | you want that release, refreshed weekly while it is the newest |
 | `1.3.3` | you want the newest image built for that game version |
-| `2.4.0-1.3.3` | you want a pin that never moves |
 | `latest` | you want whatever is newest |
 
 ## Configure
@@ -80,7 +78,7 @@ to move:
 | Variable | What it does |
 | --- | --- |
 | `WORLD_NAME` | World to load or create. A single existing world in `./data` is picked up on its own. |
-| `SERVER_PASSWORD` | Join password; blank runs the server open. `SERVER_PASSWORD_FILE` reads it from a Docker secret instead. |
+| `SERVER_PASSWORD` | Join password; blank runs the server open. Kept in a file only the server can read and never shown in the logs. `SERVER_PASSWORD_FILE` reads it from a Docker secret instead. |
 | `SERVER_SLOTS` | Player slots (default `10`). |
 | `SERVER_OWNER` | Player name that gets owner permissions on join. |
 | `SERVER_MOTD` | Message shown to players on join. |
