@@ -8,6 +8,7 @@
 #   IMAGE=necesse-server:dev tests/run-fixtures.sh            all automated checks
 #   IMAGE=... tests/run-fixtures.sh keep brammys               start the brammys-style fixture, leave it up
 #   IMAGE=... tests/run-fixtures.sh keep karyeet               same for karyeet-style
+#   IMAGE=... tests/run-fixtures.sh keep filecfg               same for karyeet-style with file-mounted cfg
 #   tests/run-fixtures.sh clean                                stop and remove what this script created
 #
 # Environment: IMAGE (image under test), BASELINE_IMAGE (default ghcr.io/stargumbo/necesse-server:2.3.0;
@@ -130,17 +131,18 @@ case_aliases() {
     say "Aliases: brammys-style env only"
     rm_c n24-alias-b
     docker run -d --name n24-alias-b -e WORLD=AliasWorld -e PASSWORD="${PASSWORD}" -e OWNER=AliasOwner \
-        -e SLOTS=7 -e "MOTD=alias motd" -e PAUSE=1 -e GIVE_CLIENTS_POWER=1 "${IMAGE}" >/dev/null
+        -e SLOTS=7 -e "MOTD=alias motd" -e PAUSE=1 -e GIVE_CLIENTS_POWER=1 -e JVMARGS=-Xmx1G "${IMAGE}" >/dev/null
     wait_for n24-alias-b "Started server" || true
     L="$(logs n24-alias-b)"
-    grep -E '^WARN|^  /app' <<<"${L}" | sed 's|^  /app/jre/bin/java.*-nogui|  <java> -jar Server.jar -nogui|'
-    check "exactly 6 alias WARN lines (GIVE_CLIENTS_POWER is already canonical)" \
-        [ "$(grep -c '^WARN: .* is accepted as an alias of ' <<<"${L}")" -eq 6 ]
+    grep -E '^WARN|^  /app' <<<"${L}" | sed 's|^  /app/jre/bin/java|  <java>|'
+    check "exactly 7 alias WARN lines (GIVE_CLIENTS_POWER is already canonical)" \
+        [ "$(grep -c '^WARN: .* is accepted as an alias of ' <<<"${L}")" -eq 7 ]
     local pair
-    for pair in WORLD:WORLD_NAME PASSWORD:SERVER_PASSWORD OWNER:SERVER_OWNER SLOTS:SERVER_SLOTS MOTD:SERVER_MOTD PAUSE:PAUSE_WHEN_EMPTY; do
+    for pair in WORLD:WORLD_NAME PASSWORD:SERVER_PASSWORD OWNER:SERVER_OWNER SLOTS:SERVER_SLOTS MOTD:SERVER_MOTD PAUSE:PAUSE_WHEN_EMPTY JVMARGS:JAVA_OPTS; do
         check "  WARN for ${pair%%:*} names ${pair#*:}" grep -q "^WARN: ${pair%%:*} is accepted as an alias of ${pair#*:} " <<<"${L}"
     done
     check "  argv carries the alias values" grep -qE -- '-world +AliasWorld .*-slots +7 .*-owner +AliasOwner .*-motd +alias motd .*-pausewhenempty +1 .*-giveclientspower +1' <<<"${L}"
+    check "  JVMARGS reached the JVM command line" grep -qE -- '^  /app/jre/bin/java +-Xmx1G +-jar' <<<"${L}"
     check "  server started" grep -q "Started server using port 14159 with 7 slots" <<<"${L}"
     check "  cfg holds the aliased password" docker exec n24-alias-b grep -q "password = ${PASSWORD}," "${DATADIR}/cfg/server.cfg"
     password_hidden n24-alias-b "${L}"
@@ -149,15 +151,16 @@ case_aliases() {
     say "Aliases: karyeet-style lower-case keys"
     rm_c n24-alias-k
     docker run -d --name n24-alias-k -e world=AliasWorld -e password="${PASSWORD}" -e owner=AliasOwner \
-        -e slots=7 -e "MOTD=alias motd" -e pauseWhenEmpty=true -e giveClientsPower=true "${IMAGE}" >/dev/null
+        -e slots=7 -e "MOTD=alias motd" -e pauseWhenEmpty=true -e giveClientsPower=true -e JVM_OPTS=-Xmx1G "${IMAGE}" >/dev/null
     wait_for n24-alias-k "Started server" || true
     L="$(logs n24-alias-k)"
-    grep -E '^WARN|^  /app' <<<"${L}" | sed 's|^  /app/jre/bin/java.*-nogui|  <java> -jar Server.jar -nogui|'
-    check "exactly 7 alias WARN lines" [ "$(grep -c '^WARN: .* is accepted as an alias of ' <<<"${L}")" -eq 7 ]
-    for pair in world:WORLD_NAME password:SERVER_PASSWORD owner:SERVER_OWNER slots:SERVER_SLOTS MOTD:SERVER_MOTD pauseWhenEmpty:PAUSE_WHEN_EMPTY giveClientsPower:GIVE_CLIENTS_POWER; do
+    grep -E '^WARN|^  /app' <<<"${L}" | sed 's|^  /app/jre/bin/java|  <java>|'
+    check "exactly 8 alias WARN lines" [ "$(grep -c '^WARN: .* is accepted as an alias of ' <<<"${L}")" -eq 8 ]
+    for pair in world:WORLD_NAME password:SERVER_PASSWORD owner:SERVER_OWNER slots:SERVER_SLOTS MOTD:SERVER_MOTD pauseWhenEmpty:PAUSE_WHEN_EMPTY giveClientsPower:GIVE_CLIENTS_POWER JVM_OPTS:JAVA_OPTS; do
         check "  WARN for ${pair%%:*} names ${pair#*:}" grep -q "^WARN: ${pair%%:*} is accepted as an alias of ${pair#*:} " <<<"${L}"
     done
     check "  argv carries the alias values" grep -qE -- '-world +AliasWorld .*-slots +7 .*-owner +AliasOwner .*-motd +alias motd .*-pausewhenempty +true .*-giveclientspower +true' <<<"${L}"
+    check "  JVM_OPTS reached the JVM command line" grep -qE -- '^  /app/jre/bin/java +-Xmx1G +-jar' <<<"${L}"
     check "  server started" grep -q "Started server using port 14159 with 7 slots" <<<"${L}"
     check "  cfg holds the aliased password" docker exec n24-alias-k grep -q "password = ${PASSWORD}," "${DATADIR}/cfg/server.cfg"
     password_hidden n24-alias-k "${L}"
@@ -274,27 +277,85 @@ case_shim_karyeet() {
     compose_down n24-karyeet "${d}"
 }
 
-case_shim_file_cfg() {
-    local d="${RIG}/karyeet-filecfg" L
-    say "karyeet-style with server.cfg/banned.cfg mounted as single files (documented limitation: WARN, cfg not adopted)"
+setup_karyeet_filecfg() {
+    local d="${RIG}/karyeet-filecfg"
     reclaim "${d}"; rm -rf "${d}"; mkdir -p "${d}/saves/worlds" "${d}/logs" "${d}/mods"
     cp "$(world_zip Legacy)" "${d}/saves/worlds/Legacy.zip"
     seed_cfg_from Legacy "${d}"
-    docker run --rm -v "${d}:/x" busybox chown -R 0:0 /x >/dev/null
-    # root-owned 0600 on the host: read the checksums through a container.
-    local before; before="$(docker run --rm -v "${d}:/x" busybox md5sum /x/server.cfg)"
-    rm_c n24-filecfg
-    docker run -d --name n24-filecfg --stop-timeout 60 -e world=Legacy -e password="${PASSWORD}" \
-        -v "${d}/saves:/root/.config/Necesse/saves" -v "${d}/logs:/root/.config/Necesse/logs" -v "${d}/mods:/root/.config/Necesse/mods" \
-        -v "${d}/server.cfg:/root/.config/Necesse/cfg/server.cfg" -v "${d}/banned.cfg:/root/.config/Necesse/cfg/banned.cfg" "${IMAGE}" >/dev/null
-    wait_for n24-filecfg "Started server" || true
-    L="$(logs n24-filecfg)"
-    grep -E '^Using |^WARN' <<<"${L}"
-    check "WARN names the file mount and the fix" grep -q "^WARN: /root/.config/Necesse/cfg/server.cfg and/or banned.cfg are mounted as single files.*mount the directory instead: ./cfg:/root/.config/Necesse/cfg" <<<"${L}"
-    check "saves, logs and mods still shimmed (3 lines)" [ "$(grep -c '(legacy layout)\.$' <<<"${L}")" -eq 3 ]
-    check "server started from the image's own cfg" grep -q "Started server using port 14159" <<<"${L}"
-    check "the mounted server.cfg was not modified" [ "$(docker run --rm -v "${d}:/x" busybox md5sum /x/server.cfg)" = "${before}" ]
-    rm_c n24-filecfg
+    cp "${FIXTURES}/karyeet-style-file-cfg.yml" "${d}/compose.yml"
+    docker run --rm -v "${d}:/x" busybox chown -R 0:0 /x/saves /x/logs /x/mods /x/server.cfg /x/banned.cfg >/dev/null
+    printf '%s' "${d}"
+}
+case_shim_file_cfg() {
+    local d L
+    say "karyeet-style with server.cfg/banned.cfg mounted as single files, password from env (sender addition 1)"
+    d="$(setup_karyeet_filecfg)"
+    # root-owned 0600 on the host: read the checksum through a container.
+    local banned_before; banned_before="$(docker run --rm -v "${d}:/x" busybox md5sum /x/banned.cfg | cut -d' ' -f1)"
+    WORLD=Legacy compose_up n24-kfile "${d}" necesse_server
+    wait_for necesse_server_filecfg "Started server" || true
+    L="$(logs necesse_server_filecfg)"
+    grep -E '^Using |^WARN|Loading existing world at|Started server' <<<"${L}"
+    check "four shim lines, cfg one noting the file mount" [ "$(grep -c '(legacy layout' <<<"${L}")" -eq 4 ]
+    check "  Using .../cfg (legacy layout; server.cfg is a file mount, written in place)" grep -q "^Using /root/.config/Necesse/cfg for cfg (legacy layout; server.cfg is a file mount, written in place)\.$" <<<"${L}"
+    check "  the game loaded the existing world" grep -q "Loading existing world at ${DATADIR}/saves/worlds/Legacy.zip" <<<"${L}"
+    check "  server started" grep -q "Started server using port" <<<"${L}"
+    check "  the mounted server.cfg now holds the env password" grep -q "password = ${PASSWORD}," "${d}/server.cfg"
+    check "  the mounted server.cfg is 0600 owned 1000:1000" [ "$(stat -c %u:%g:%a "${d}/server.cfg")" = "1000:1000:600" ]
+    check "  banned.cfg untouched" [ "$(docker run --rm -v "${d}:/x" busybox md5sum /x/banned.cfg | cut -d' ' -f1)" = "${banned_before}" ]
+    check "  the game announced a password (redacted to ****)" grep -q 'with password "\*\*\*\*"' <<<"${L}"
+    password_hidden necesse_server_filecfg "${L}"
+    local out; out="$(docker exec necesse_server_filecfg console players 2>&1)" || true
+    check "  console players -> Players online: 0/10" grep -q "Players online: 0/10" <<<"${out}"
+    check "healthcheck reports healthy" wait_healthy necesse_server_filecfg
+    if [ "${KEEP:-0}" = "1" ]; then return; fi
+    compose_stop n24-kfile "${d}"
+    check "console-stop save line on docker compose stop" grep -q "Completed world save before stopping server" <<<"$(logs necesse_server_filecfg)"
+    compose_down n24-kfile "${d}"
+}
+
+case_file_cfg_readonly() {
+    local d="${RIG}/karyeet-filecfg-ro" L rc
+    say "server.cfg mounted read-only as a single file -> refuse, name both, never start with the wrong password"
+    reclaim "${d}"; rm -rf "${d}"; mkdir -p "${d}/saves/worlds" "${d}/logs"
+    cp "$(world_zip Legacy)" "${d}/saves/worlds/Legacy.zip"
+    seed_cfg_from Legacy "${d}"
+    local before; before="$(md5sum < "${d}/server.cfg")"
+    rm_c n24-filecfg-ro
+    docker run -d --name n24-filecfg-ro -e world=Legacy -e password="${PASSWORD}" \
+        -v "${d}/saves:/root/.config/Necesse/saves" -v "${d}/logs:/root/.config/Necesse/logs" \
+        -v "${d}/server.cfg:/root/.config/Necesse/cfg/server.cfg:ro" "${IMAGE}" >/dev/null
+    rc="$(wait_exit n24-filecfg-ro 60)"; L="$(logs n24-filecfg-ro)"; tail -1 <<<"${L}"
+    check "container exited non-zero (exit ${rc})" bash -c "[ '${rc}' != running ] && [ '${rc}' -ne 0 ]"
+    check "message names the data-dir path and the mounted file" grep -q "^${DATADIR}/cfg/server.cfg is the single-file mount /root/.config/Necesse/cfg/server.cfg, and it cannot be written" <<<"${L}"
+    check "no 'Started server' line" bash -c "! grep -q 'Started server' <<<'${L//\'/}'"
+    check "the mounted file is unchanged" [ "$(md5sum < "${d}/server.cfg")" = "${before}" ]
+    rm_c n24-filecfg-ro
+}
+
+case_legacy_password_guard() {
+    local d="${RIG}/pwguard" L rc
+    say "legacy server.cfg carries a password, no password variable set -> refuse instead of opening the server"
+    reclaim "${d}"; rm -rf "${d}"; mkdir -p "${d}/dir/saves/worlds" "${d}/dir/cfg" "${d}/file/saves/worlds"
+    cp "$(world_zip Legacy)" "${d}/dir/saves/worlds/"; cp "$(world_zip Legacy)" "${d}/file/saves/worlds/"
+    seed_cfg_from Legacy "${d}/dir/cfg"; seed_cfg_from Legacy "${d}/file"
+    sed -i 's/^\tpassword = ,/\tpassword = Old-Secret-1,/' "${d}/dir/cfg/server.cfg" "${d}/file/server.cfg"
+    rm_c n24-pw-dir n24-pw-file n24-pw-ok
+    docker run -d --name n24-pw-dir -e world=Legacy -v "${d}/dir/saves:/root/.config/Necesse/saves" -v "${d}/dir/cfg:/root/.config/Necesse/cfg" "${IMAGE}" >/dev/null
+    docker run -d --name n24-pw-file -e world=Legacy -v "${d}/file/saves:/root/.config/Necesse/saves" -v "${d}/file/server.cfg:/root/.config/Necesse/cfg/server.cfg" "${IMAGE}" >/dev/null
+    rc="$(wait_exit n24-pw-dir 60)"; L="$(logs n24-pw-dir)"; tail -1 <<<"${L}"
+    check "directory-mounted cfg: exit ${rc}, message names the file and SERVER_PASSWORD" bash -c "[ '${rc}' != running ] && [ '${rc}' -ne 0 ] && grep -q '^/root/.config/Necesse/cfg/server.cfg carries a join password, but neither SERVER_PASSWORD' <<<'${L//\'/}'"
+    check "  the old password is not printed" [ "$(grep -c 'Old-Secret-1' <<<"${L}")" -eq 0 ]
+    check "  file still holds the old password (nothing written)" grep -q "password = Old-Secret-1," "${d}/dir/cfg/server.cfg"
+    rc="$(wait_exit n24-pw-file 60)"; L="$(logs n24-pw-file)"
+    check "file-mounted cfg: exit ${rc}, same refusal" bash -c "[ '${rc}' != running ] && [ '${rc}' -ne 0 ] && grep -q '^/root/.config/Necesse/cfg/server.cfg carries a join password, but neither SERVER_PASSWORD' <<<'${L//\'/}'"
+    check "  file still holds the old password" grep -q "password = Old-Secret-1," "${d}/file/server.cfg"
+    say "  same layout with a password variable set -> starts, file now holds the configured password"
+    docker run -d --name n24-pw-ok -e world=Legacy -e password="${PASSWORD}" -v "${d}/dir/saves:/root/.config/Necesse/saves" -v "${d}/dir/cfg:/root/.config/Necesse/cfg" "${IMAGE}" >/dev/null
+    wait_for n24-pw-ok "Started server" || true
+    check "server started" grep -q "Started server using port" <<<"$(logs n24-pw-ok)"
+    check "server.cfg holds the configured password" grep -q "password = ${PASSWORD}," "${d}/dir/cfg/server.cfg"
+    rm_c n24-pw-dir n24-pw-file n24-pw-ok
 }
 
 case_shim_safety() {
@@ -387,11 +448,11 @@ case_autodetect() {
 # ------------------------------------------------------------------------------------------------
 do_clean() {
     say "Cleaning up"
-    compose_down n24-brammys "${RIG}/brammys"; compose_down n24-karyeet "${RIG}/karyeet"
+    compose_down n24-brammys "${RIG}/brammys"; compose_down n24-karyeet "${RIG}/karyeet"; compose_down n24-kfile "${RIG}/karyeet-filecfg"
     compose_down n24-base "${RIG}/logdiff/base"; compose_down n24-new "${RIG}/logdiff/new"
-    rm_c n24-alias-b n24-alias-k n24-alias-c n24-filecfg n24-safety n24-zero-base n24-zero-new n24-ad-one n24-ad-many n24-ad-def n24-worldgen
-    reclaim "${RIG}/karyeet"; reclaim "${RIG}/karyeet-filecfg"
-    rm -rf "${RIG}/brammys" "${RIG}/karyeet" "${RIG}/karyeet-filecfg" "${RIG}/safety" "${RIG}/logdiff" "${RIG}/autodetect"
+    rm_c n24-alias-b n24-alias-k n24-alias-c n24-filecfg n24-filecfg-ro n24-pw-dir n24-pw-file n24-pw-ok n24-safety n24-zero-base n24-zero-new n24-ad-one n24-ad-many n24-ad-def n24-worldgen
+    reclaim "${RIG}/karyeet"; reclaim "${RIG}/karyeet-filecfg"; reclaim "${RIG}/karyeet-filecfg-ro"; reclaim "${RIG}/pwguard"
+    rm -rf "${RIG}/brammys" "${RIG}/karyeet" "${RIG}/karyeet-filecfg" "${RIG}/karyeet-filecfg-ro" "${RIG}/pwguard" "${RIG}/safety" "${RIG}/logdiff" "${RIG}/autodetect"
     echo "kept: ${RIG}/worlds (generated world saves)"
 }
 
@@ -406,7 +467,11 @@ do_keep() {
             case_shim_karyeet
             echo; echo "karyeet-style fixture is UP: container necesse_server, world Legacy, password ${PASSWORD}, 10 slots${MODS_COLLECTION:+, MODS_COLLECTION=${MODS_COLLECTION}}."
             ;;
-        *) echo "keep needs brammys or karyeet" >&2; exit 2 ;;
+        filecfg)
+            case_shim_file_cfg
+            echo; echo "karyeet-style file-mounted-cfg fixture is UP: container necesse_server_filecfg, world Legacy, password ${PASSWORD}, 10 slots."
+            ;;
+        *) echo "keep needs brammys, karyeet or filecfg" >&2; exit 2 ;;
     esac
     if [ "${HOST_NET}" = "1" ]; then echo "Join at 127.0.0.1:${PORT:-14159} (host networking)."; else echo "Join at <this host>:14159/udp."; fi
     printf '\nPASS %d  FAIL %d\n' "${PASS}" "${FAIL}"
@@ -422,6 +487,8 @@ case "${1:-all}" in
         case_shim_brammys
         case_shim_karyeet
         case_shim_file_cfg
+        case_file_cfg_readonly
+        case_legacy_password_guard
         case_shim_safety
         case_shim_off_logdiff
         case_autodetect

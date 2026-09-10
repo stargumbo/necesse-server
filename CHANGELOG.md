@@ -12,9 +12,9 @@ the alternative names set and no legacy path mounted, the entrypoint logs exactl
 `MODS_*` are untouched (the mod surface is frozen at 2.3.0).
 
 ### Added
-- Environment aliases: `WORLD`, `PASSWORD`, `OWNER`, `SLOTS`, `MOTD`, `PAUSE` (brammys-style) and
-  `world`, `password`, `owner`, `slots`, `pauseWhenEmpty`, `giveClientsPower` (karyeet-style
-  `server.cfg` keys) fill their canonical variables when those are unset. Each alias used logs one
+- Environment aliases: `WORLD`, `PASSWORD`, `OWNER`, `SLOTS`, `MOTD`, `PAUSE`, `JVMARGS`
+  (brammys-style) and `world`, `password`, `owner`, `slots`, `pauseWhenEmpty`, `giveClientsPower`,
+  `JVM_OPTS` (karyeet-style `server.cfg` keys) fill their canonical variables when those are unset. Each alias used logs one
   `WARN` naming the canonical variable; when both are set the canonical one wins, with a `WARN`
   saying so. One data table in `entrypoint.sh` (`ENV_ALIASES`); an alias is one more line. The
   password aliases follow the 2.1.0 path: written to `cfg/server.cfg`, redacted, removed from the
@@ -26,7 +26,13 @@ the alternative names set and no legacy path mounted, the entrypoint logs exactl
   symlinks inside the data directory are ever created. If the data directory already holds files
   under that name the container exits non-zero naming both locations; `LOCAL_DIR=1` together with a
   legacy mount is refused. `server.cfg`/`banned.cfg` mounted as single files (karyeet-style compose)
-  are not adopted: a `WARN` says so and names the directory mount to use instead.
+  are adopted too: the directory holding them is linked and the join password is written into the
+  mounted `server.cfg` in place (a file mount cannot be renamed over); if that write fails
+  (read-only mount) the container exits non-zero naming the file rather than run with another
+  password.
+- Password guard for legacy layouts: a shimmed `server.cfg` that already carries a join password
+  while no password variable is set makes the container exit non-zero naming the file, instead of
+  blanking the field and opening the server.
 - World auto-detect: with `WORLD_NAME` (and its aliases) unset, exactly one world under
   `saves/worlds/` is loaded (`Loading existing world <name> (auto-detected from saves/worlds/).`);
   none creates `world` as before; several exit non-zero listing them, unless one of them is `world`,

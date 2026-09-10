@@ -91,6 +91,7 @@ data_dir() {
 # one more line. The canonical variable always wins, and an alias that is used produces exactly one
 # warning naming the canonical variable. Keys with no counterpart here (karyeet-style `language`,
 # `zipSaves`, `port`, ...) are not listed: they live in server.cfg, which carries over untouched.
+# JVMARGS (brammys-style) and JVM_OPTS (karyeet-style) were added on the sender's request.
 ENV_ALIASES="
 WORLD=WORLD_NAME
 PASSWORD=SERVER_PASSWORD
@@ -104,6 +105,8 @@ owner=SERVER_OWNER
 slots=SERVER_SLOTS
 pauseWhenEmpty=PAUSE_WHEN_EMPTY
 giveClientsPower=GIVE_CLIENTS_POWER
+JVMARGS=JAVA_OPTS
+JVM_OPTS=JAVA_OPTS
 "
 
 apply_env_aliases() {
@@ -144,6 +147,7 @@ apply_defaults() {
 LEGACY_LAYOUT_ROOTS="/necesse /root/.config/Necesse"
 LEGACY_LAYOUT_NAMES="saves logs cfg mods"
 SHIMMED_PATHS=""
+CFG_SHIMMED=0
 
 is_mount_point() {
     # Field 5 of /proc/self/mountinfo is the mount point. The paths checked here contain no spaces,
@@ -176,15 +180,17 @@ link_legacy_mounts() {
         fi
         for name in ${LEGACY_LAYOUT_NAMES}; do
             legacy="${root}/${name}"
+            note=""
             if is_mount_point "${legacy}"; then
                 :
             elif [ "${root_mounted}" -eq 1 ] && [ -d "${legacy}" ]; then
                 :
+            elif [ "${name}" = "cfg" ] && is_mount_point "${legacy}/server.cfg"; then
+                # karyeet-style compose files mount server.cfg (and banned.cfg) as single files inside
+                # cfg/. The directory holding them is linked like any other; write_password_to_cfg
+                # rewrites the mounted server.cfg in place, since a file mount cannot be renamed over.
+                note="; server.cfg is a file mount, written in place"
             else
-                # karyeet-style compose files mount server.cfg and banned.cfg as single files inside cfg/.
-                if [ "${name}" = "cfg" ] && { is_mount_point "${legacy}/server.cfg" || is_mount_point "${legacy}/banned.cfg"; }; then
-                    echo "WARN: ${legacy}/server.cfg and/or banned.cfg are mounted as single files. This image cannot adopt a file mount in place (the join password is written into server.cfg with an atomic rename, which a file mount does not permit), so those two files are not used and the server starts from this image's own cfg/. To keep them, mount the directory instead: ./cfg:${legacy} (see README, Coming from another image)." >&2
-                fi
                 continue
             fi
             if [ "${local_dir_flag}" = "1" ] || [ "${local_dir_flag}" = "true" ]; then
@@ -197,8 +203,9 @@ link_legacy_mounts() {
             fi
             if [ -L "${target}" ]; then
                 if [ "$(readlink "${target}")" = "${legacy}" ]; then
-                    echo "Using ${legacy} for ${name} (legacy layout)."
+                    echo "Using ${legacy} for ${name} (legacy layout${note})."
                     SHIMMED_PATHS="${SHIMMED_PATHS} ${legacy}"
+                    [ "${name}" = "cfg" ] && CFG_SHIMMED=1
                     continue
                 fi
                 echo "${target} is already a symlink to $(readlink "${target}"), not to the mounted ${legacy}; refusing to guess which one is meant. Remove the link or the mount. Refusing to start." >&2
@@ -222,15 +229,21 @@ link_legacy_mounts() {
             if is_root; then
                 chown -h "${RUN_USER}:${RUN_GROUP}" "${target}"
             fi
-            echo "Using ${legacy} for ${name} (legacy layout)."
+            echo "Using ${legacy} for ${name} (legacy layout${note})."
             SHIMMED_PATHS="${SHIMMED_PATHS} ${legacy}"
+            [ "${name}" = "cfg" ] && CFG_SHIMMED=1
         done
     done
     # PUID/PGID remap: adjust_permissions' chown -R does not follow symlinks, so the linked trees
-    # (root-owned in a karyeet-style setup) are re-owned here.
-    if is_root && [ -n "${SHIMMED_PATHS}" ]; then
-        # shellcheck disable=SC2086
-        chown -R "${RUN_USER}:${RUN_GROUP}" ${SHIMMED_PATHS}
+    # (root-owned in a karyeet-style setup) are re-owned here. A read-only mount cannot be re-owned;
+    # that is only a warning here, because write_password_to_cfg refuses to start with a proper
+    # message if the file that matters cannot be written.
+    if is_root; then
+        for p in ${SHIMMED_PATHS}; do
+            if ! chown -R "${RUN_USER}:${RUN_GROUP}" "${p}" 2>/dev/null; then
+                echo "WARN: could not change the owner of everything under ${p} (read-only mount?); continuing." >&2
+            fi
+        done
     fi
 }
 
@@ -339,6 +352,34 @@ server_cfg_path() {
     fi
 }
 
+# Put the finished temp file in place of server.cfg. A server.cfg that is itself a bind mount
+# (karyeet-style compose: ./server.cfg:/root/.config/Necesse/cfg/server.cfg) cannot be renamed over,
+# so it is rewritten in place; if that write fails (read-only mount) the container refuses to start
+# rather than run with a password other than the configured one.
+install_cfg() {
+    src="$1"
+    dest="$2"
+    real="$(readlink -f "${dest}")"
+    if is_mount_point "${real}"; then
+        if ! cat "${src}" > "${dest}" 2>/dev/null; then
+            rm -f "${src}"
+            echo "${dest} is the single-file mount ${real}, and it cannot be written (read-only mount?), so the join password cannot be applied to it. Mount it writable, or mount the directory instead (./cfg:$(dirname "${real}")). Refusing to start rather than run with a password other than the configured one." >&2
+            exit 1
+        fi
+        rm -f "${src}"
+        chmod 600 "${dest}" 2>/dev/null || true
+        if is_root; then
+            chown "${RUN_USER}:${RUN_GROUP}" "${dest}" 2>/dev/null || true
+        fi
+    else
+        chmod 600 "${src}"
+        if is_root; then
+            chown "${RUN_USER}:${RUN_GROUP}" "${src}"
+        fi
+        mv -f "${src}" "${dest}"
+    fi
+}
+
 # Rewrite the `password` field every start, blank included: the game keeps whatever the file says,
 # so a password removed from the environment must also be removed from the file.
 write_password_to_cfg() {
@@ -390,7 +431,17 @@ CFG
         fi
         # Custom settings file without the key: add it right after the block opener.
         awk '{ print } /^[[:space:]]*SERVER[[:space:]]*=[[:space:]]*\{/ && !done { print "\tpassword = , // Leave blank for no password"; done = 1 }' "${cfg}" > "${tmp}"
-        mv -f "${tmp}" "${cfg}"
+        install_cfg "${tmp}" "${cfg}"
+    fi
+
+    # A legacy layout's server.cfg is the migrant's source of truth. If it already carries a password
+    # and none is configured here, blanking it would open the server without anyone asking for that.
+    if [ "${CFG_SHIMMED}" -eq 1 ] && [ -z "${RESOLVED_PASSWORD}" ]; then
+        existing="$(sed -n 's/^[[:space:]]*password[[:space:]]*=[[:space:]]*\([^,]*\),.*/\1/p' "${cfg}" | head -n 1 | sed 's/[[:space:]]*$//')"
+        if [ -n "${existing}" ]; then
+            echo "$(readlink -f "${cfg}") carries a join password, but neither SERVER_PASSWORD nor SERVER_PASSWORD_FILE (nor an alias such as PASSWORD or password) is set. This image writes the configured password into that file on every start, which would open the server. Set SERVER_PASSWORD (to that password or a new one), or blank the password field in the file to run open on purpose. Refusing to start." >&2
+            exit 1
+        fi
     fi
 
     # Replace the value in place, keeping the trailing comment. The value travels through the
@@ -405,11 +456,7 @@ CFG
         }
         { print }' "${cfg}" > "${tmp}"
 
-    chmod 600 "${tmp}"
-    if is_root; then
-        chown "${RUN_USER}:${RUN_GROUP}" "${tmp}"
-    fi
-    mv -f "${tmp}" "${cfg}"
+    install_cfg "${tmp}" "${cfg}"
 }
 
 # --- Steam Workshop mods -----------------------------------------------------------------------

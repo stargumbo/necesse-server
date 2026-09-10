@@ -179,8 +179,8 @@ Layout `/necesse/saves`, `/necesse/logs`, `/necesse/cfg` (and `/necesse/mods`); 
   logging one `WARN` that names the canonical variable: `WORLD` -> `WORLD_NAME`, `PASSWORD` ->
   `SERVER_PASSWORD`, `OWNER` -> `SERVER_OWNER`, `SLOTS` -> `SERVER_SLOTS`, `MOTD` -> `SERVER_MOTD`,
   `PAUSE` -> `PAUSE_WHEN_EMPTY` (`GIVE_CLIENTS_POWER` is the same name). When both are set the
-  canonical one wins. `LOGGING`, `ZIP` and `JVMARGS` have no alias: use `ENABLE_LOGGING`, `ZIP_SAVES`
-  and `JAVA_OPTS` (the defaults match).
+  canonical one wins. `JVMARGS` -> `JAVA_OPTS` the same way. `LOGGING` and `ZIP` have no alias: use
+  `ENABLE_LOGGING` and `ZIP_SAVES` (the defaults match).
 - **World.** With `WORLD` unset, the single world under `saves/worlds/` is loaded and logged
   (`Loading existing world <name> (auto-detected from saves/worlds/).`); with several, set
   `WORLD_NAME`.
@@ -196,24 +196,32 @@ Layout `/root/.config/Necesse/{saves,logs,cfg,mods}` with root-owned files; envi
 `server.cfg` key names (`world`, `slots`, `password`, `pauseWhenEmpty`, `giveClientsPower`, `owner`,
 `MOTD`, ...); console through `docker attach`.
 
-- **Keep your volumes**, as above, with one exception. `server.cfg` and `banned.cfg` mounted as
-  **single files** (`./server.cfg:/root/.config/Necesse/cfg/server.cfg`) cannot be adopted: this
-  image rewrites `server.cfg` with an atomic rename to put the password in, which a file mount
-  does not allow. The container logs a `WARN` and starts from its own `cfg/`. To keep your settings
-  and ban list, move the two files into a `cfg/` directory and mount that:
-  `./cfg:/root/.config/Necesse/cfg`. `saves`, `logs` and `mods` need no change.
+- **Keep your volumes**, as above, including `server.cfg` and `banned.cfg` mounted as **single
+  files** (`./server.cfg:/root/.config/Necesse/cfg/server.cfg`): the directory holding them is
+  linked in and the log says so (`... for cfg (legacy layout; server.cfg is a file mount, written in
+  place).`). The join password is written into that mounted `server.cfg` in place, because a file
+  mount cannot be replaced, so the file must be writable: mounted read-only, the container refuses
+  to start and names the file, rather than run with a password other than the configured one.
+  Mounting the directory instead (`./cfg:/root/.config/Necesse/cfg`) works as well.
+- **Your password stays a password.** If the legacy `server.cfg` already carries a join password and
+  no password variable is set here (`password`, `PASSWORD`, `SERVER_PASSWORD`,
+  `SERVER_PASSWORD_FILE`), the container refuses to start instead of blanking the field and opening
+  the server. Set `SERVER_PASSWORD` (to the same or a new password), or blank the field yourself to
+  run open on purpose. This applies to every legacy layout.
 - **`PUID` / `PGID`.** The server runs as an unprivileged user here, so the mounted files are
   re-owned to `PUID:PGID` (default `1000:1000`) at start. Set them to the ids the files should end
   up with.
-- **Environment.** `world`, `slots`, `password`, `pauseWhenEmpty`, `giveClientsPower`, `owner` and
-  `MOTD` are accepted as aliases (one `WARN` each naming the canonical variable). The other keys
-  (`port`, `language`, `zipSaves`, `maxClientLatencySeconds`, ...) are not read from the environment
-  here: they stay in your `server.cfg`, which is used as it is. `JVM_OPTS` becomes `JAVA_OPTS`.
+- **Environment.** `world`, `slots`, `password`, `pauseWhenEmpty`, `giveClientsPower`, `owner`,
+  `MOTD` and `JVM_OPTS` are accepted as aliases (one `WARN` each naming the canonical variable). The
+  other keys (`port`, `language`, `zipSaves`, `maxClientLatencySeconds`, ...) are not read from the
+  environment here: they stay in your `server.cfg`, which is used as it is.
 - **Console.** Instead of `docker attach`, `docker exec necesse_server console players` types the
   command and prints the reply (see Console below).
 
-[`tests/fixtures/karyeet-style.yml`](tests/fixtures/karyeet-style.yml) is such a compose file
-(image line changed, cfg mounted as a directory).
+[`tests/fixtures/karyeet-style-file-cfg.yml`](tests/fixtures/karyeet-style-file-cfg.yml) is such a
+compose file with only the image line changed;
+[`tests/fixtures/karyeet-style.yml`](tests/fixtures/karyeet-style.yml) is the same with `cfg`
+mounted as a directory.
 
 ### Going back
 
@@ -398,7 +406,7 @@ menu should match the server's. What to expect:
 | `STOP_TIMEOUT_SECONDS` | How long the entrypoint waits for the server to exit after typing `stop` before falling back to `SIGTERM` (default `50`; keep it below the container's stop grace period). |
 | `PUID` / `PGID` | Host UID/GID to chown the bind mount to. The entrypoint remaps the `necesse` user before launching the JVM. |
 | `IMAGE_TAG` | Override image tag in Compose (default `latest`). |
-| Aliases | `WORLD`, `PASSWORD`, `OWNER`, `SLOTS`, `MOTD`, `PAUSE` and `world`, `password`, `owner`, `slots`, `pauseWhenEmpty`, `giveClientsPower` fill the canonical variables above when those are unset, one `WARN` per alias used; see Coming from another image. |
+| Aliases | `WORLD`, `PASSWORD`, `OWNER`, `SLOTS`, `MOTD`, `PAUSE`, `JVMARGS` and `world`, `password`, `owner`, `slots`, `pauseWhenEmpty`, `giveClientsPower`, `JVM_OPTS` fill the canonical variables above when those are unset, one `WARN` per alias used; see Coming from another image. |
 
 ---
 

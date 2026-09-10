@@ -1,0 +1,34 @@
+# A compose file as written for the karyeet-style image, with only the image line changed: server.cfg
+# and banned.cfg stay mounted as single files. The directory holding them is linked into this image's
+# data directory and the join password from the environment is written into the mounted server.cfg
+# in place (a file mount cannot be renamed over), so the file must be writable; a read-only mount
+# makes the container refuse to start. (container_name differs from karyeet-style.yml only so both
+# fixtures can run side by side; stop_grace_period is added because the server saves on stop.)
+services:
+  necesse_server:
+    image: ${IMAGE:-ghcr.io/stargumbo/necesse-server:2}
+    container_name: necesse_server_filecfg
+    restart: unless-stopped
+    stop_grace_period: 60s
+    ports:
+      - "14159:14159/udp"
+    volumes:
+      - ./server.cfg:/root/.config/Necesse/cfg/server.cfg
+      - ./banned.cfg:/root/.config/Necesse/cfg/banned.cfg
+      - ./saves:/root/.config/Necesse/saves
+      - ./logs:/root/.config/Necesse/logs
+      - ./mods:/root/.config/Necesse/mods
+    environment:
+      - world=${WORLD:-myNewWorld}
+      - port=14159
+      - slots=10
+      - password=${PASSWORD:-}
+      - maxClientLatencySeconds=30
+      - pauseWhenEmpty=true
+      - giveClientsPower=true
+      - logging=true
+      - language=en
+      - zipSaves=true
+      - MOTD=
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
