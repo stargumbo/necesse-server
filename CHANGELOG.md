@@ -11,6 +11,9 @@ changing the image line, and go back the same way. For everyone else nothing cha
 the alternative names set and no legacy path mounted, the entrypoint logs exactly what 2.3.0 did.
 `MODS_*` are untouched (the mod surface is frozen at 2.3.0).
 
+Also in this release, from the unreleased 2.3.1 work: the image is published to Docker Hub as
+well as GHCR and carries game-version tags (see below); neither changes the image itself.
+
 ### Added
 - Environment aliases: `WORLD`, `PASSWORD`, `OWNER`, `SLOTS`, `MOTD`, `PAUSE`, `JVMARGS`
   (brammys-style) and `world`, `password`, `owner`, `slots`, `pauseWhenEmpty`, `giveClientsPower`,
@@ -46,17 +49,6 @@ the alternative names set and no legacy path mounted, the entrypoint logs exactl
   `tests/run-fixtures.sh` exercises them (aliases, shim, safety refusal, log diff against 2.3.0,
   auto-detect, console, guarantees).
 
-### Changed
-- `WORLD_NAME`, `SERVER_SLOTS`, `PAUSE_WHEN_EMPTY` and `GIVE_CLIENTS_POWER` are no longer image
-  `ENV` defaults; the entrypoint applies the same defaults (`world`, `10`, `0`, `0`) after the
-  aliases, so that an alias can fill them. Effective values and the launch command are unchanged.
-
-## [2.3.1] - 2026-09-10
-
-No runtime change: the image built from this tag has the 2.3.0 `Dockerfile` and entrypoint. This
-release is about where the image can be found and how it can be pinned.
-
-### Added
 - Docker Hub: every release and weekly rebuild is pushed to `docker.io/stargumbo/necesse-server`
   as well as `ghcr.io/stargumbo/necesse-server`, from one build, so a tag has the same digest on
   both registries. The workflow verifies that after the push and stops before any further tagging
@@ -64,7 +56,7 @@ release is about where the image can be found and how it can be pinned.
   and `DOCKERHUB_TOKEN` repository secrets exist; without them the workflow publishes to GHCR
   exactly as before (`.github/workflows/publish.yml`).
 - Game-version tags: `X.Y.Z-<game>` (never re-pointed), `<game>` and `<game major.minor>`
-  (floating), for example `2.3.1-1.3.3`, `1.3.3` and `1.3`. The game version is read from
+  (floating), for example `2.4.0-1.3.3`, `1.3.3` and `1.3`. The game version is read from
   `Server.jar` inside the image that was just pushed, never hard-coded: `scripts/game-version.py`
   takes the single bare version constant in `necesse/engine/GameInfo.class` and cross-checks it
   against that class's `Version X.Y.Z` string. The weekly rebuild moves the floating game tags only
@@ -75,6 +67,9 @@ release is about where the image can be found and how it can be pinned.
   class layout fails CI on the next push instead of the next release.
 
 ### Changed
+- `WORLD_NAME`, `SERVER_SLOTS`, `PAUSE_WHEN_EMPTY` and `GIVE_CLIENTS_POWER` are no longer image
+  `ENV` defaults; the entrypoint applies the same defaults (`world`, `10`, `0`, `0`) after the
+  aliases, so that an alias can fill them. Effective values and the launch command are unchanged.
 - README: new "Tags" section listing both registries and which tags float; the stale
   `docs/DOCKER_HUB_OVERVIEW.md` now points at the README sync.
 
@@ -212,6 +207,7 @@ First release of the `stargumbo/necesse-server` fork, published as `ghcr.io/star
 ## [1.3.1] - 2025-10-27
 ### Added
 - Image-level healthcheck matching the Compose probe so `docker run` users get liveness status (`Dockerfile`).
+
 ### Changed
 - Compose service now relies on the baked-in healthcheck and enforces memory limits with `mem_limit`/`mem_reservation` so limits work outside Swarm (`docker-compose.yml`).
 - README Compose example mirrors the actual service definition, listing explicit environment variables instead of `env_file` (`README.md`).
@@ -221,6 +217,7 @@ First release of the `stargumbo/necesse-server` fork, published as `ghcr.io/star
 ### Added
 - README badges for CI status, latest release, Docker pulls, and image size.
 - Necesse trailer GIF below the badges.
+
 ### Changed
 - README examples now default to the `latest` image tag and reference the bundled `docker-compose.yml` / `.env.example`.
 
@@ -231,6 +228,7 @@ First release of the `stargumbo/necesse-server` fork, published as `ghcr.io/star
 ## [1.1.0] - 2025-10-22
 ### Added
 - GitHub Actions publishes Docker images to Docker Hub (`andreasgl4ser/necesse-server`) on tagged releases.
+
 ### Changed
 - `docker-compose.yml` now defaults to the published Docker Hub image and accepts an optional `IMAGE_TAG`.
 - README refocused on Docker Hub workflows with updated quickstart examples.
@@ -238,6 +236,7 @@ First release of the `stargumbo/necesse-server` fork, published as `ghcr.io/star
 ## [1.0.0] - 2025-10-22
 ### Added
 - Automatic update watcher controlled by `AUTO_UPDATE_INTERVAL_MINUTES` that checks Steam for new builds and restarts the server.
+
 ### Changed
 - Reworked README for server admins with clearer quickstart, management guidance, and streamlined feature notes.
 - Auto-update now logs when periodic checks are enabled so admins know the cadence.

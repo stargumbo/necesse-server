@@ -127,14 +127,14 @@ Each release `vX.Y.Z` of this image is built against one Necesse version, `<game
 | --- | --- | --- | --- |
 | `X` | `2` | newest image of that major (**recommended pin**) | every release and weekly rebuild within the major |
 | `X.Y` | `2.3` | newest image of that minor | every patch release and weekly rebuild within the minor |
-| `X.Y.Z` | `2.3.1` | that release | the weekly rebuild, while it is the newest release (same code, refreshed base image and Steam build) |
+| `X.Y.Z` | `2.4.0` | that release | the weekly rebuild, while it is the newest release (same code, refreshed base image and Steam build) |
 | `latest` | `latest` | newest image | every release and weekly rebuild |
 | `<game>` | `1.3.3` | newest image built for that game version | every release built for that game version; a weekly rebuild only when the game version changed |
 | `<game major.minor>` | `1.3` | newest image built for that game minor | same rule as `<game>` |
-| `X.Y.Z-<game>` | `2.3.1-1.3.3` | exactly one image, forever | never |
+| `X.Y.Z-<game>` | `2.4.0-1.3.3` | exactly one image, forever | never |
 
 So `2` follows fixes and rebuilds without breaking changes, `1.3.3` follows the newest image that
-runs that game version, and `2.3.1-1.3.3` is the fully immutable pin. The weekly rebuild
+runs that game version, and `2.4.0-1.3.3` is the fully immutable pin. The weekly rebuild
 (Mondays, 05:17 UTC) exists so that the SteamCMD base image and the Steam server build stay
 current between releases; when Steam ships a new game version, the rebuild publishes new
 `<game>` tags for it and the previous `<game>` tags keep pointing at the last image built for the
