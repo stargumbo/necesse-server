@@ -204,15 +204,27 @@ CFG
 }
 
 # --- Steam Workshop mods -----------------------------------------------------------------------
-# MODS_WORKSHOP is a comma-separated list of Workshop item ids. Before the first server launch each
-# one is fetched with an anonymous SteamCMD login and the single jar it contains is copied FLAT into
-# <datadir>/mods as ws-<id>-<OriginalName>.jar: the game only loads bare jars from that directory,
-# and SteamCMD's own download lands outside the bind mount, so it would vanish on recreate.
-# Jars carrying the ws- prefix are managed: on every start the ones whose id is no longer listed
-# are deleted, and that is the only deletion this script ever performs. Anything else in mods/ is
-# left alone. The fetch runs once per container start, never while Server.jar is running and not on
-# auto-update restarts. An empty MODS_WORKSHOP leaves mods/ untouched (2.1.0 behaviour).
+# Two ways to say which Workshop items the server runs; the union of both is fetched.
+#   MODS_COLLECTION: one Workshop collection id. Resolved at every container start through the
+#     public GetCollectionDetails endpoint (no key, no login) into the ids it holds, so adding or
+#     removing a mod is an edit in the Steam client plus a container restart: no .env edit, no
+#     recreate. The resolved ids are kept in <datadir>/ws-collection.txt as last-known-good, and a
+#     Steam Web API outage falls back to that file so the mods hash does not change and players
+#     are not locked out. Nested collections are not followed. A collection that resolves to no
+#     file items is refused: that is a wrong id, not a request to run unmodded.
+#   MODS_WORKSHOP: a comma-separated list of item ids, for people who do not want a collection.
+# Before the first server launch each id is fetched with an anonymous SteamCMD login and the single
+# jar it contains is copied FLAT into <datadir>/mods as ws-<id>-<OriginalName>.jar: the game only
+# loads bare jars from that directory, and SteamCMD's own download lands outside the bind mount,
+# so it would vanish on recreate. Jars carrying the ws- prefix are managed: on every start the
+# ones whose id is no longer listed are deleted, and that is the only deletion this script ever
+# performs. Anything else in mods/ is left alone. Resolution and fetch run once per container
+# start, never while Server.jar is running and not on auto-update restarts. With both variables
+# empty mods/ is left untouched (2.1.0 behaviour).
 MODS_WORKSHOP_IDS=""
+MODS_COLLECTION_IDS=""
+# Override only to exercise the failure paths in a test; not a user-facing setting.
+STEAM_API_BASE="${MODS_STEAM_API_BASE:-https://api.steampowered.com}"
 
 mods_dir() {
     if [ -n "${DATA_DIR:-}" ]; then
@@ -229,31 +241,162 @@ mods_fail_fast() {
     [ "${flag}" != "false" ] && [ "${flag}" != "0" ] && [ "${flag}" != "no" ]
 }
 
-# Cheap checks first, so a bad list or a LOCAL_DIR conflict fails before SteamCMD is touched.
+# Cheap checks first, so a bad list or a LOCAL_DIR conflict fails before the network is touched.
 validate_workshop_config() {
     MODS_WORKSHOP_IDS=""
-    if [ -z "${MODS_WORKSHOP:-}" ]; then
+    if [ -z "${MODS_WORKSHOP:-}" ] && [ -z "${MODS_COLLECTION:-}" ]; then
         return
     fi
 
     local_dir_flag="$(lowercase "${LOCAL_DIR:-0}")"
     if [ "$local_dir_flag" = "1" ] || [ "$local_dir_flag" = "true" ]; then
-        echo "MODS_WORKSHOP cannot be combined with LOCAL_DIR=1: with -localdir the game loads mods from ${APP_DIR}/mods inside the image, not from the data directory, so managed jars would not persist. Refusing to start." >&2
+        echo "MODS_COLLECTION/MODS_WORKSHOP cannot be combined with LOCAL_DIR=1: with -localdir the game loads mods from ${APP_DIR}/mods inside the image, not from the data directory, so managed jars would not persist. Refusing to start." >&2
         exit 1
     fi
 
+    case "${MODS_COLLECTION:-}" in
+        *[!0-9]*)
+            echo "MODS_COLLECTION '${MODS_COLLECTION}' is not a single numeric Steam Workshop collection id (the number in the collection's URL); refusing to start." >&2
+            exit 1
+            ;;
+    esac
+
     # shellcheck disable=SC2086
-    for id in $(printf '%s' "${MODS_WORKSHOP}" | tr ',' ' '); do
+    for id in $(printf '%s' "${MODS_WORKSHOP:-}" | tr ',' ' '); do
         case "${id}" in
             *[!0-9]*)
                 echo "MODS_WORKSHOP entry '${id}' is not a numeric Steam Workshop item id; refusing to start." >&2
                 exit 1
                 ;;
         esac
-        case " ${MODS_WORKSHOP_IDS} " in
-            *" ${id} "*) ;;
-            *) MODS_WORKSHOP_IDS="${MODS_WORKSHOP_IDS}${MODS_WORKSHOP_IDS:+ }${id}" ;;
-        esac
+        add_workshop_id "${id}"
+    done
+}
+
+add_workshop_id() {
+    case " ${MODS_WORKSHOP_IDS} " in
+        *" $1 "*) ;;
+        *) MODS_WORKSHOP_IDS="${MODS_WORKSHOP_IDS}${MODS_WORKSHOP_IDS:+ }$1" ;;
+    esac
+}
+
+collection_cache_path() {
+    dir="$(mods_dir)"
+    printf '%s' "${dir%/mods}/ws-collection.txt"
+}
+
+# POST to the Steam Web API. Prints the body on success. On any transport or HTTP failure prints
+# nothing, returns non-zero and leaves the reason (curl's stderr) in STEAM_API_ERR_FILE for the
+# caller: this runs inside a command substitution, so a variable could not carry it back.
+STEAM_API_ERR_FILE="/tmp/necesse-steam-api-err"
+steam_api_post() {
+    if ! curl -sS -f --max-time 30 --retry 2 --retry-delay 3 \
+            -X POST --data "$2" "${STEAM_API_BASE}$1" 2>"${STEAM_API_ERR_FILE}"; then
+        return 1
+    fi
+    rm -f "${STEAM_API_ERR_FILE}"
+}
+
+steam_api_error() {
+    if [ -s "${STEAM_API_ERR_FILE}" ]; then
+        head -n 1 "${STEAM_API_ERR_FILE}" | sed 's/^curl: ([0-9]*) //; s/ *$//'
+    else
+        printf 'request failed'
+    fi
+    rm -f "${STEAM_API_ERR_FILE}"
+}
+
+# Resolve MODS_COLLECTION into MODS_COLLECTION_IDS and merge them into MODS_WORKSHOP_IDS.
+# Transport/API errors are "resolution failed" (cache fallback, else MODS_FAIL_FAST decides);
+# a definite answer that the id is wrong (not found, not public, no file items) is refused outright.
+resolve_workshop_collection() {
+    MODS_COLLECTION_IDS=""
+    if [ -z "${MODS_COLLECTION:-}" ]; then
+        return
+    fi
+
+    cache="$(collection_cache_path)"
+    echo "Workshop collection: resolving ${MODS_COLLECTION} through the public Steam Web API..."
+    failure=""
+    body=""
+    if ! body="$(steam_api_post /ISteamRemoteStorage/GetCollectionDetails/v1/ "collectioncount=1&publishedfileids[0]=${MODS_COLLECTION}")"; then
+        failure="$(steam_api_error)"
+    elif ! printf '%s' "${body}" | grep -q '"response":{"result":1'; then
+        failure="unexpected API response: $(printf '%s' "${body}" | head -c 200)"
+    else
+        # The collection's own entry: {"publishedfileid":"<id>","result":N,"children":[...]}.
+        # result 1 = found; 9 = no such public collection.
+        coll_result="$(printf '%s' "${body}" | tr '{' '\n' | grep "\"publishedfileid\":\"${MODS_COLLECTION}\"" | grep -v '"filetype"' | sed -n 's/.*"result":\([0-9]*\).*/\1/p' | head -n 1)"
+        if [ "${coll_result}" != "1" ]; then
+            echo "Workshop collection: ${MODS_COLLECTION} is not a public Steam Workshop collection (API result ${coll_result:-missing}); check the id in the collection's URL. Refusing to start." >&2
+            exit 1
+        fi
+
+        # children[]: {"publishedfileid":"<id>","sortorder":n,"filetype":t}; 0 = file item, 2 = collection.
+        children="$(printf '%s' "${body}" | tr '{' '\n' | awk '
+            /"filetype"/ {
+                id = ""; type = ""
+                if (match($0, /"publishedfileid":"[0-9]+"/)) { id = substr($0, RSTART + 19, RLENGTH - 20) }
+                if (match($0, /"filetype":[0-9]+/)) { type = substr($0, RSTART + 11, RLENGTH - 11) }
+                if (id != "" && type != "") { print id ":" type }
+            }')"
+        for child in ${children}; do
+            cid="${child%%:*}"
+            ctype="${child#*:}"
+            case "${ctype}" in
+                0)
+                    case " ${MODS_COLLECTION_IDS} " in
+                        *" ${cid} "*) ;;
+                        *) MODS_COLLECTION_IDS="${MODS_COLLECTION_IDS}${MODS_COLLECTION_IDS:+ }${cid}" ;;
+                    esac
+                    ;;
+                2)
+                    echo "Workshop collection: WARNING: ${cid} inside ${MODS_COLLECTION} is itself a collection; nested collections are not followed, so its items are skipped. Add them to ${MODS_COLLECTION} directly." >&2
+                    ;;
+                *)
+                    echo "Workshop collection: WARNING: ${cid} inside ${MODS_COLLECTION} has filetype ${ctype}, not a Workshop file item; skipped." >&2
+                    ;;
+            esac
+        done
+
+        if [ -z "${MODS_COLLECTION_IDS}" ]; then
+            echo "Workshop collection: ${MODS_COLLECTION} holds no Workshop file items. That is almost certainly the wrong id (or an empty collection); to run without mods unset MODS_COLLECTION instead. Refusing to start." >&2
+            exit 1
+        fi
+    fi
+
+    if [ -n "${failure}" ]; then
+        if [ -s "${cache}" ]; then
+            MODS_COLLECTION_IDS="$(grep -E '^[0-9]+$' "${cache}" | tr '\n' ' ' | sed 's/ *$//')"
+            echo "Workshop collection: WARNING: could not resolve ${MODS_COLLECTION} (${failure}); using the last-known-good ${cache##*/} ($(printf '%s' "${MODS_COLLECTION_IDS}" | wc -w) item(s) from $(date -u -r "${cache}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo 'an earlier start')). The mod set is unchanged from the last successful resolution." >&2
+        elif mods_fail_fast; then
+            echo "Workshop collection: could not resolve ${MODS_COLLECTION} (${failure}) and there is no previous ${cache##*/} to fall back to; refusing to start (MODS_FAIL_FAST=true)." >&2
+            exit 1
+        else
+            echo "Workshop collection: WARNING: could not resolve ${MODS_COLLECTION} (${failure}) and there is no previous ${cache##*/} to fall back to; starting with MODS_WORKSHOP ids only (MODS_FAIL_FAST=false)." >&2
+        fi
+    else
+        count="$(printf '%s' "${MODS_COLLECTION_IDS}" | wc -w)"
+        echo "Workshop collection: ${MODS_COLLECTION} resolved to ${count} item(s): ${MODS_COLLECTION_IDS}."
+        cache_dir="$(dirname "${cache}")"
+        if [ ! -d "${cache_dir}" ]; then
+            mkdir -p "${cache_dir}"
+            if is_root; then
+                chown "${RUN_USER}:${RUN_GROUP}" "${cache_dir}"
+            fi
+        fi
+        tmp="${cache}.tmp.$$"
+        # shellcheck disable=SC2086
+        printf '%s\n' ${MODS_COLLECTION_IDS} > "${tmp}"
+        chmod 600 "${tmp}"
+        if is_root; then
+            chown "${RUN_USER}:${RUN_GROUP}" "${tmp}"
+        fi
+        mv -f "${tmp}" "${cache}"
+    fi
+
+    for cid in ${MODS_COLLECTION_IDS}; do
+        add_workshop_id "${cid}"
     done
 }
 
@@ -390,7 +533,7 @@ fetch_workshop_mods() {
         case " ${MODS_WORKSHOP_IDS} " in
             *" ${jid} "*) ;;
             *)
-                echo "Workshop mods: removing ${base} (item ${jid} is no longer in MODS_WORKSHOP)."
+                echo "Workshop mods: removing ${base} (item ${jid} is no longer listed)."
                 rm -f "${jar}"
                 ;;
         esac
@@ -735,6 +878,7 @@ trap 'handle_exit' INT TERM
 adjust_permissions
 resolve_password
 validate_workshop_config
+resolve_workshop_collection
 fetch_workshop_mods
 open_console
 open_output

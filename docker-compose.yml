@@ -44,6 +44,7 @@ services:
       - JAVA_OPTS=${JAVA_OPTS}
 
       # Steam Workshop mods (see README: Workshop mods)
+      - MODS_COLLECTION=${MODS_COLLECTION}
       - MODS_WORKSHOP=${MODS_WORKSHOP}
       - MODS_FAIL_FAST=${MODS_FAIL_FAST:-true}
       - PUID=${PUID}

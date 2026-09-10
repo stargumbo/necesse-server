@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The format is based on 
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-09-09
+
+Mod changes no longer need a `.env` edit or a container recreate. A Steam Workshop **collection**
+is now the recommended source of the mod list: edit it in the Steam client, restart the
+container, done; players subscribe to the collection with one click. `MODS_WORKSHOP` stays as
+the explicit-list alternative. With both unset the image behaves exactly as 2.2.0.
+
+### Added
+- `MODS_COLLECTION`: one public Workshop collection id. At container start, before the 2.2.0
+  fetch, the collection is resolved through Steam's public `ISteamRemoteStorage/GetCollectionDetails`
+  endpoint (POST, no API key, no login) into its file items; the log names the id and the item
+  count. The ids are handed to the unchanged 2.2.0 fetch/manage/manifest path, so the `ws-<id>-`
+  jar layout, revalidation, prefix-only deletion and `ws-manifest.txt` are as before. When
+  `MODS_WORKSHOP` is also set the union is fetched; an id in both is fetched once
+  (`entrypoint.sh`).
+- `<data>/ws-collection.txt` (`0600`): the ids from the last successful resolution. If the Web API
+  cannot be reached on a later start, the entrypoint warns with the cause and starts from this
+  file, so the mods hash players are checked against does not change. A resolution failure with
+  no such file yet is governed by `MODS_FAIL_FAST`: `true` exits non-zero naming the collection
+  and the cause, `false` warns and starts with the `MODS_WORKSHOP` ids only.
+- Refusals with a clear message: a non-numeric `MODS_COLLECTION`, an id that is not a public
+  collection, or a collection with zero file items (a wrong id, not a wish to run unmodded).
+  Nested collections are not followed: each is skipped with a warning naming it.
+- `MODS_COLLECTION` in `.env.example`, `docker-compose.yml` and the image `ENV` defaults. README
+  "Workshop mods" section rewritten around the collection workflow; "For players" now says to
+  subscribe to the collection.
+
+### Changed
+- The managed-jar removal log line reads "is no longer listed" instead of naming
+  `MODS_WORKSHOP`, since an id can now also drop out of the collection.
+- `LOCAL_DIR=1` is refused when either `MODS_COLLECTION` or `MODS_WORKSHOP` is set (2.2.0
+  refused it for `MODS_WORKSHOP` only).
+- The image now installs `curl` (about 12 MB of rootfs) to make the Web API request; the
+  `steamcmd` base ships no HTTP client.
+
 ## [2.2.0] - 2026-09-09
 
 Steam Workshop mods can now be installed by the container itself. With `MODS_WORKSHOP` unset the

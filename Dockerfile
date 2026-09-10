@@ -6,8 +6,9 @@ ARG BUILD_REVISION=unknown
 ARG uid=1000
 ARG gid=1000
 
-# gosu drops privileges in the entrypoint; procps provides pgrep/pkill for the healthcheck and auto-update.
-RUN apt-get update && apt-get install -y --no-install-recommends gosu procps \
+# gosu drops privileges in the entrypoint; procps provides pgrep/pkill for the healthcheck and auto-update;
+# curl resolves MODS_COLLECTION through the Steam Web API (the base image ships no HTTP client).
+RUN apt-get update && apt-get install -y --no-install-recommends gosu procps curl \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd -g ${gid} necesse && useradd -u ${uid} -g necesse -s /bin/bash -m necesse \
  && mkdir -p /app /steamapps /home/necesse/.config/Necesse \
@@ -45,7 +46,7 @@ ENV CONTAINER_USER=necesse CONTAINER_GROUP=necesse CONTAINER_UID=${uid} CONTAINE
     PAUSE_WHEN_EMPTY=0 GIVE_CLIENTS_POWER=0 ENABLE_LOGGING=1 ZIP_SAVES=1 SERVER_LANGUAGE=en \
     SETTINGS_FILE= BIND_IP= MAX_CLIENT_LATENCY= LOCAL_DIR=0 DATA_DIR= LOGS_DIR= \
     UPDATE_ON_START=false AUTO_UPDATE_INTERVAL_MINUTES=0 JAVA_OPTS= \
-    MODS_WORKSHOP= MODS_FAIL_FAST=true
+    MODS_COLLECTION= MODS_WORKSHOP= MODS_FAIL_FAST=true
 
 EXPOSE 14159/udp
 # Exec form on purpose: a shell-form check runs inside `sh -c "pgrep -f 'Server.jar' ..."`, whose own

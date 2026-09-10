@@ -27,9 +27,11 @@ This is a fork of [andreas-glaser/necesse-docker-server](https://github.com/andr
 - **The join password stays off the command line and out of the logs.** Written to `cfg/server.cfg`
   (0600), redacted from `docker logs`, removed from the Java environment; `SERVER_PASSWORD_FILE`
   takes a Docker secret. See Secrets below.
-- **Steam Workshop mods, fetched by the server.** `MODS_WORKSHOP=<id>,<id>` pulls the listed items
-  anonymously at container start and keeps them as managed jars in `data/mods`. Players still have
-  to subscribe themselves. See Workshop mods below.
+- **Steam Workshop mods, fetched by the server.** `MODS_COLLECTION=<collection id>` resolves a
+  public Workshop collection at container start and keeps its items as managed jars in
+  `data/mods`; edit the collection in Steam and restart the container to change mods. Players
+  subscribe to the collection. `MODS_WORKSHOP=<id>,<id>` is the explicit-list alternative. See
+  Workshop mods below.
 - **amd64 only.**
 
 ---
@@ -146,54 +148,86 @@ The plain `.env` route (`SERVER_PASSWORD=...` with `env_file: .env`) keeps worki
 
 ## Workshop mods
 
-Since 2.2.0 the container can install [Steam Workshop](https://steamcommunity.com/app/1169040/workshop/)
-mods on the server side. With `MODS_WORKSHOP` unset or blank nothing changes: the entrypoint never
-touches `mods/` and behaves exactly like 2.1.0.
+The container installs [Steam Workshop](https://steamcommunity.com/app/1169040/workshop/) mods on
+the server side. The recommended way (2.3.0) is a **Workshop collection**: you manage the mod list
+in the Steam client, players subscribe to the collection with one click, and a container
+**restart** applies changes. No `.env` edit, no recreate, no SSH. With `MODS_COLLECTION` and
+`MODS_WORKSHOP` both unset or blank nothing changes: the entrypoint never calls Steam, never
+touches `mods/`, and behaves exactly like 2.1.0.
 
 ```bash
-docker run -d ... -e MODS_WORKSHOP=2827931647,3344934623 ghcr.io/stargumbo/necesse-server:2
+docker run -d ... -e MODS_COLLECTION=3798051104 ghcr.io/stargumbo/necesse-server:2
 ```
 
-- **`MODS_WORKSHOP`**: comma-separated Workshop item ids (the number in the item's URL). At every
-  container start, before the server launches, each id is downloaded with an anonymous SteamCMD
-  login (`workshop_download_item 1169040 <id>`; no Steam account is involved) and the single `.jar`
-  it contains is copied into `data/mods/` as **`ws-<id>-<OriginalName>.jar`**, mode `0600`, owned
-  by `PUID:PGID`. The game loads bare jars from that directory; the Workshop's own
-  `content/<id>/` layout is not loadable, and the download lands outside the bind mount, which is
-  why the jar is copied rather than linked. An unchanged item is revalidated (about 6 s) and the
-  copy is left as it is; a changed one replaces the copy. Expect roughly 10 s per item on a fresh
-  container.
-- **Managed vs. your own jars.** Only files named `ws-<id>-*.jar` are managed. When an id is
-  removed from `MODS_WORKSHOP`, its `ws-` jar is deleted on the next start. Jars you place in
-  `data/mods/` yourself are never touched, listed, or deleted, and they load alongside the managed
-  ones. Clearing `MODS_WORKSHOP` entirely turns the feature off and leaves whatever is in `mods/`
-  in place; to remove managed jars, remove the ids first (or delete the `ws-*.jar` files by hand
-  while the server is stopped).
-- **`MODS_FAIL_FAST`** (default `true`): if any listed item fails to download, the container exits
-  non-zero before the server starts, naming the id. A server that comes up with only part of its
-  mod list has a different mods hash and refuses every player who subscribed to the full list, so
-  not starting is the safer failure. Set it to `false` to log a warning and start with whatever
-  fetched (a previously installed managed jar for the failed id is kept).
-- **`data/ws-manifest.txt`** (beside `mods/`, not inside it: the game warns about every non-jar file
-  in `mods/`) is rewritten after each fetch, one tab-separated line per listed
-  id: the id, the jar name, the Workshop `manifest` and `timeupdated` values from SteamCMD's
+1. In the Steam client (or on the website), create a collection for Necesse, add the mods, and
+   make it **public**. The number in its URL is the collection id.
+2. Set `MODS_COLLECTION=<that id>` once and start the container.
+3. To add or remove a mod later: edit the collection, then restart the container
+   (`docker restart necesse`, or the restart button in Container Manager / Portainer). The
+   restart saves the world through the console `stop`, resolves the collection again, fetches
+   what is new, deletes what was removed, and relaunches: about 40 s of downtime.
+
+How it works, and what each setting does:
+
+- **`MODS_COLLECTION`**: one public Workshop collection id. At every container start, before the
+  server launches, the collection is resolved through Steam's public `GetCollectionDetails`
+  endpoint (no API key, no Steam account) into the item ids it holds; the log line names the id
+  and the item count. Nested collections inside it are **not** followed: each is skipped with a
+  warning naming it, so add their items to your collection directly. A collection that resolves
+  to **zero** items, an id that is not a public collection, or a non-numeric value is refused
+  with a clear message: that is almost always a wrong id, not a wish to run unmodded. To run
+  without mods, unset the variable.
+- **`data/ws-collection.txt`** (mode `0600`) holds the ids from the last successful resolution.
+  If Steam's Web API cannot be reached at a later start (outage, DNS, network), the entrypoint
+  logs a warning with the cause and starts from that file, so the mod set, and with it the mods
+  hash that players are checked against, stays exactly what it was. Only a start with no such
+  file yet is governed by `MODS_FAIL_FAST`.
+- **`MODS_WORKSHOP`**: the explicit alternative, a comma-separated list of Workshop item ids
+  (the number in the item's URL). It can be used alone, or together with `MODS_COLLECTION`, in
+  which case the union is fetched and an id present in both is fetched once. Changing it needs
+  a recreate, which is why the collection is the recommended path.
+- **Fetch and layout.** Each id is downloaded with an anonymous SteamCMD login
+  (`workshop_download_item 1169040 <id>`) and the single `.jar` it contains is copied into
+  `data/mods/` as **`ws-<id>-<OriginalName>.jar`**, mode `0600`, owned by `PUID:PGID`. The game
+  loads bare jars from that directory; the Workshop's own `content/<id>/` layout is not
+  loadable, and the download lands outside the bind mount, which is why the jar is copied rather
+  than linked. An unchanged item is revalidated (about 6 s) and the copy is left as it is; a
+  changed one replaces the copy. Expect roughly 10 s per item on a fresh container.
+- **Managed vs. your own jars.** Only files named `ws-<id>-*.jar` are managed. When an id is no
+  longer listed (removed from the collection or from `MODS_WORKSHOP`), its `ws-` jar is deleted
+  on the next start. Jars you place in `data/mods/` yourself are never touched, listed, or
+  deleted, and they load alongside the managed ones. Clearing both variables turns the feature
+  off and leaves whatever is in `mods/` in place; to remove managed jars, remove the ids first
+  (or delete the `ws-*.jar` files by hand while the server is stopped).
+- **`MODS_FAIL_FAST`** (default `true`): if any listed item fails to download, or the collection
+  cannot be resolved and there is no `ws-collection.txt` to fall back to, the container exits
+  non-zero before the server starts, naming the id and the cause. A server that comes up with
+  only part of its mod list has a different mods hash and refuses every player who subscribed to
+  the full list, so not starting is the safer failure. Set it to `false` to log a warning and
+  start with whatever fetched (a previously installed managed jar for a failed id is kept; a
+  failed first resolution starts with the `MODS_WORKSHOP` ids only).
+- **`data/ws-manifest.txt`** (beside `mods/`, not inside it: the game warns about every non-jar
+  file in `mods/`) is rewritten after each fetch, one tab-separated line per listed id: the id,
+  the jar name, the Workshop `manifest` and `timeupdated` values from SteamCMD's
   `appworkshop_1169040.acf`, and `status=ok|failed`. That is how you tell which revision of a mod
   is live. Anonymous SteamCMD always fetches the item's current revision; the copied jar is the
-  only pin, so an author update is picked up on the next container start (the running server keeps
-  the jar it loaded).
+  only pin, so an author update is picked up on the next container start (the running server
+  keeps the jar it loaded).
 - **Not compatible with `LOCAL_DIR=1`.** With `-localdir` the game reads mods from `/app/mods`
   inside the image, where they would not survive a recreate; the entrypoint refuses that
   combination and exits.
-- The fetch runs only at container start, never while the server is running, and not on the
-  `AUTO_UPDATE_INTERVAL_MINUTES` restart path. `UPDATE_ON_START` (the Steam *app* update) and the
-  Workshop items are independent: either can update without touching the other.
+- Resolution and fetch run only at container start, never while the server is running, and not
+  on the `AUTO_UPDATE_INTERVAL_MINUTES` restart path. `UPDATE_ON_START` (the Steam *app* update)
+  and the Workshop items are independent: either can update without touching the other.
 
 ### For players
 
-The server cannot push mods to anyone. To join a modded server you must **subscribe to the same
-Workshop items yourself** in the Steam Workshop for Necesse, then start the game so Steam
-downloads them; the mod list in the game's Mods menu should match the server's `MODS_WORKSHOP`.
-What to expect:
+The server cannot push mods to anyone. To join a modded server, **subscribe to the server's
+collection** in the Steam Workshop for Necesse (the "Subscribe to all" button on the collection
+page), then start the game so Steam downloads the mods. When the operator changes the collection,
+Steam adds or removes the subscriptions for you on the next client start; if a server uses
+`MODS_WORKSHOP` instead, subscribe to those item ids one by one. The mod list in the game's Mods
+menu should match the server's. What to expect:
 
 - A client without the server's mods is refused (the server logs `connected with wrong mods`;
   the client shows the mods mismatch dialog). The **"Use server mods"** button in that dialog
@@ -231,8 +265,9 @@ What to expect:
 | `DATA_DIR`, `LOGS_DIR` | Override in-container paths (folders auto-created). |
 | `UPDATE_ON_START` | `true` runs SteamCMD on every boot. |
 | `AUTO_UPDATE_INTERVAL_MINUTES` | Background poll interval; the server is stopped via console `stop` (saving the world), updated, and restarted when a new Steam build is detected (`0` disables). |
-| `MODS_WORKSHOP` | Comma-separated Steam Workshop item ids to install server-side as `data/mods/ws-<id>-*.jar` (see Workshop mods). Blank disables; not allowed with `LOCAL_DIR=1`. |
-| `MODS_FAIL_FAST` | `true` (default): a failed Workshop download stops the container before the server starts. `false`: warn and start with what fetched. |
+| `MODS_COLLECTION` | One public Steam Workshop collection id, resolved at every start (no key, no login) into the items to install as `data/mods/ws-<id>-*.jar`; a restart applies collection edits (see Workshop mods). Blank disables; not allowed with `LOCAL_DIR=1`. |
+| `MODS_WORKSHOP` | Comma-separated Steam Workshop item ids to install the same way; union with the collection. Blank disables; not allowed with `LOCAL_DIR=1`. |
+| `MODS_FAIL_FAST` | `true` (default): a failed Workshop download, or a failed collection resolution with no `ws-collection.txt` to fall back to, stops the container before the server starts. `false`: warn and start with what fetched. |
 | `JAVA_OPTS` | Extra JVM flags (e.g. `-Xmx2G`). The official `StartServer-nogui.sh` uses `-XX:+UseG1GC -XX:MaxGCPauseMillis=50 …`; pass them here if you want the same tuning. |
 | `JAVA_BIN` | Path of the JRE to launch with (default `/app/jre/bin/java`, the JRE bundled with the Steam build). |
 | `STOP_TIMEOUT_SECONDS` | How long the entrypoint waits for the server to exit after typing `stop` before falling back to `SIGTERM` (default `50`; keep it below the container's stop grace period). |
