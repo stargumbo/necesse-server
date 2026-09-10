@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format is based on 
 
 ## [Unreleased]
 
+## [2.3.1] - 2026-09-10
+
+No runtime change: the image built from this tag has the 2.3.0 `Dockerfile` and entrypoint. This
+release is about where the image can be found and how it can be pinned.
+
+### Added
+- Docker Hub: every release and weekly rebuild is pushed to `docker.io/stargumbo/necesse-server`
+  as well as `ghcr.io/stargumbo/necesse-server`, from one build, so a tag has the same digest on
+  both registries. The workflow verifies that after the push and stops before any further tagging
+  if the registries disagree. Docker Hub publishing is active only while the `DOCKERHUB_USERNAME`
+  and `DOCKERHUB_TOKEN` repository secrets exist; without them the workflow publishes to GHCR
+  exactly as before (`.github/workflows/publish.yml`).
+- Game-version tags: `X.Y.Z-<game>` (never re-pointed), `<game>` and `<game major.minor>`
+  (floating), for example `2.3.1-1.3.3`, `1.3.3` and `1.3`. The game version is read from
+  `Server.jar` inside the image that was just pushed, never hard-coded: `scripts/game-version.py`
+  takes the single bare version constant in `necesse/engine/GameInfo.class` and cross-checks it
+  against that class's `Version X.Y.Z` string. The weekly rebuild moves the floating game tags only
+  when the game version changed.
+- The Docker Hub overview and short description are synced from the top of `README.md` (down to
+  the `docker-hub-overview-ends-here` marker) on every publish.
+- CI checks that the game version is detectable in every built image, so a change in the game's
+  class layout fails CI on the next push instead of the next release.
+
+### Changed
+- README: new "Tags" section listing both registries and which tags float; the stale
+  `docs/DOCKER_HUB_OVERVIEW.md` now points at the README sync.
+
 ## [2.3.0] - 2026-09-09
 
 Mod changes no longer need a `.env` edit or a container recreate. A Steam Workshop **collection**

@@ -20,8 +20,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y shellcheck
 
-      - name: Shellcheck entrypoint
+      - name: Shellcheck the shell scripts
         run: shellcheck entrypoint.sh redact.sh
 
+      - name: Byte-compile the Python helpers
+        run: python3 -m py_compile scripts/game-version.py
+
       - name: Docker build
-        run: docker build --pull .
+        run: docker build --pull -t necesse-server:ci .
+
+      # publish.yml derives the game-version tags from Server.jar inside the pushed image. Catch a change in the
+      # game's class layout here, on every push, instead of at the next release.
+      - name: Game version is detectable in the built image
+        run: |
+          set -euo pipefail
+          cid="$(docker create necesse-server:ci)"
+          docker cp "${cid}:/app/Server.jar" ./Server.jar
+          docker rm "${cid}" >/dev/null
+          game="$(python3 scripts/game-version.py ./Server.jar)"
+          rm -f ./Server.jar
+          echo "Game version in the built image: ${game}"

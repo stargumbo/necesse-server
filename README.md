@@ -5,7 +5,8 @@
 [![Latest tag](https://img.shields.io/github/v/tag/stargumbo/necesse-server?sort=semver)](https://github.com/stargumbo/necesse-server/tags)
 
 Dockerised [Necesse](https://necessegame.com/) dedicated server, published as
-**`ghcr.io/stargumbo/necesse-server`**. It installs the server from Steam (app `1169370`),
+**`ghcr.io/stargumbo/necesse-server`** and, with the same digests, as
+**`stargumbo/necesse-server`** on Docker Hub. It installs the server from Steam (app `1169370`),
 keeps saves on the host, exposes every server flag through environment variables, and
 saves the world on `docker stop`.
 
@@ -21,9 +22,11 @@ This is a fork of [andreas-glaser/necesse-docker-server](https://github.com/andr
   console `stop` command. The entrypoint holds the server's stdin open on a FIFO and types `stop`
   into it when the container is stopped (and before an auto-update restart), then waits for the
   JVM to exit. Give it a `stop_grace_period` of 60s.
-- **GHCR publishing with weekly rebuilds.** Tag pushes build `:X.Y.Z`, `:X.Y`, `:X` and `:latest`;
-  a Monday cron rebuilds the newest tag with `pull: true` so the base image and the Steam server
-  build refresh unattended. All GitHub Actions are pinned by commit SHA; Dependabot tracks both.
+- **One build, two registries, weekly rebuilds.** Every release is pushed to GHCR and Docker Hub
+  from a single build, tagged by image version (`:X.Y.Z`, `:X.Y`, `:X`, `:latest`) and by game
+  version (`:X.Y.Z-<game>`, `:<game>`, `:<game major.minor>`); a Monday cron rebuilds the newest
+  release with `pull: true` so the base image and the Steam server build refresh unattended. See
+  Tags below. All GitHub Actions are pinned by commit SHA; Dependabot tracks both.
 - **The join password stays off the command line and out of the logs.** Written to `cfg/server.cfg`
   (0600), redacted from `docker logs`, removed from the Java environment; `SERVER_PASSWORD_FILE`
   takes a Docker secret. See Secrets below.
@@ -57,7 +60,7 @@ docker run -d \
 - Forward UDP port `14159` from your router/firewall to this host.
 - `--stop-timeout 60` gives the server time to save when you `docker stop` it.
 
-To follow a specific image, change the tag to e.g. `:2.0.0` (or `:2.0`, `:2`).
+To follow a specific image, change the tag (see Tags below); `:2` is the recommended pin.
 
 ---
 
@@ -99,6 +102,41 @@ docker compose logs -f necesse
 
 Never commit `.env`; it is ignored by `.gitignore`. Ship secrets through `.env` or your
 orchestrator, not through the image.
+
+---
+
+## Tags
+
+The image is pushed to two registries from one build, so a tag resolves to the same digest on
+both. Use whichever your platform finds more easily (Synology Container Manager and Portainer
+search Docker Hub by default):
+
+| Registry | Image |
+| --- | --- |
+| GitHub Container Registry | `ghcr.io/stargumbo/necesse-server` |
+| Docker Hub | `stargumbo/necesse-server` (`docker.io/stargumbo/necesse-server`) |
+
+Each release `vX.Y.Z` of this image is built against one Necesse version, `<game>` (for example
+`1.3.3`, read from `Server.jar` inside the published image), and carries these tags:
+
+| Tag | Example | Points at | Moves when |
+| --- | --- | --- | --- |
+| `X` | `2` | newest image of that major (**recommended pin**) | every release and weekly rebuild within the major |
+| `X.Y` | `2.3` | newest image of that minor | every patch release and weekly rebuild within the minor |
+| `X.Y.Z` | `2.3.1` | that release | the weekly rebuild, while it is the newest release (same code, refreshed base image and Steam build) |
+| `latest` | `latest` | newest image | every release and weekly rebuild |
+| `<game>` | `1.3.3` | newest image built for that game version | every release built for that game version; a weekly rebuild only when the game version changed |
+| `<game major.minor>` | `1.3` | newest image built for that game minor | same rule as `<game>` |
+| `X.Y.Z-<game>` | `2.3.1-1.3.3` | exactly one image, forever | never |
+
+So `2` follows fixes and rebuilds without breaking changes, `1.3.3` follows the newest image that
+runs that game version, and `2.3.1-1.3.3` is the fully immutable pin. The weekly rebuild
+(Mondays, 05:17 UTC) exists so that the SteamCMD base image and the Steam server build stay
+current between releases; when Steam ships a new game version, the rebuild publishes new
+`<game>` tags for it and the previous `<game>` tags keep pointing at the last image built for the
+previous version.
+
+<!-- docker-hub-overview-ends-here -->
 
 ---
 
@@ -343,9 +381,12 @@ docker compose up -d
 - Release process:
   1. Update [`CHANGELOG.md`](CHANGELOG.md) and documentation.
   2. `git tag -a vX.Y.Z -m "vX.Y.Z"` and `git push --follow-tags`.
-  3. `.github/workflows/publish.yml` builds and pushes `ghcr.io/stargumbo/necesse-server`
-     `:X.Y.Z`, `:X.Y`, `:X`, `:latest`. The same workflow can be dispatched manually to rebuild the
-     newest tag.
+  3. `.github/workflows/publish.yml` builds once and pushes `ghcr.io/stargumbo/necesse-server` and
+     `docker.io/stargumbo/necesse-server` with the tags listed under Tags, then syncs the Docker
+     Hub overview from the top of this README. The same workflow can be dispatched manually to
+     rebuild the newest tag. Docker Hub publishing needs the `DOCKERHUB_USERNAME` and
+     `DOCKERHUB_TOKEN` repository secrets (a Hub access token, never a password); without them the
+     workflow publishes to GHCR only and says so in its log.
 
 ---
 
@@ -353,6 +394,8 @@ docker compose up -d
 
 - [Necesse Dedicated Server wiki](https://wiki.necesse.net/wiki/Dedicated_server)
 - [Necesse Multiplayer Linux guide](https://wiki.necesse.net/wiki/Multiplayer-Linux)
+- [ghcr.io/stargumbo/necesse-server](https://github.com/stargumbo/necesse-server/pkgs/container/necesse-server)
+  and [hub.docker.com/r/stargumbo/necesse-server](https://hub.docker.com/r/stargumbo/necesse-server) — the image
 - [steamcmd/docker](https://github.com/steamcmd/docker) — the base image
 - [andreas-glaser/necesse-docker-server](https://github.com/andreas-glaser/necesse-docker-server) — upstream
 

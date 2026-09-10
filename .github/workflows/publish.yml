@@ -1,9 +1,18 @@
 name: Publish
 
-# Builds and pushes ghcr.io/<owner>/necesse-server.
-#   - push of a v* tag:      builds that tag -> :X.Y.Z, :X.Y, :X, :latest
-#   - weekly (Mondays) and manual dispatch: rebuilds the newest v* tag with pull: true so the
-#     SteamCMD base image and the Steam server build refresh unattended; pushes the same tag set.
+# One build, two registries, identical digests.
+#   ghcr.io/stargumbo/necesse-server     always
+#   docker.io/stargumbo/necesse-server   when the DOCKERHUB_USERNAME / DOCKERHUB_TOKEN repository secrets exist
+#
+#   - push of a v* tag:  builds that tag -> :X.Y.Z, :X.Y, :X, :latest, plus the game-version tags
+#                        :X.Y.Z-<game>, :<game>, :<game major.minor> (e.g. 2.3.1-1.3.3, 1.3.3, 1.3).
+#   - weekly (Mondays) and manual dispatch: rebuilds the newest v* tag with pull: true so the SteamCMD base
+#                        image and the Steam server build refresh unattended, and pushes the same semver tag
+#                        set. The floating game-version tags move only when the game version actually changed
+#                        (i.e. :<game> does not exist yet); :X.Y.Z-<game> is never re-pointed once it exists.
+#
+# The game version is read from Server.jar inside the image that was just pushed (scripts/game-version.py);
+# nothing is hard-coded. This workflow never changes the image itself.
 on:
   push:
     tags:
@@ -17,7 +26,12 @@ permissions:
   packages: write
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+  HUB_IMAGE: docker.io/stargumbo/necesse-server
+  HUB_REPOSITORY: stargumbo/necesse-server
+  # Secrets cannot be tested in `if:` directly, so the username is copied into the environment; every
+  # Docker Hub step is skipped (with a notice) while it is empty and GHCR publishing is unaffected.
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
 
 jobs:
   build-push:
@@ -57,11 +71,32 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Choose the registries
+        id: registries
+        run: |
+          set -euo pipefail
+          images="${GHCR_IMAGE}"
+          if [ -n "${DOCKERHUB_USERNAME}" ]; then
+            images="${images}"$'\n'"${HUB_IMAGE}"
+            echo "hub=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "::notice::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN are not set; publishing to GHCR only."
+            echo "hub=false" >>"$GITHUB_OUTPUT"
+          fi
+          { echo "images<<EOF"; echo "${images}"; echo "EOF"; } >>"$GITHUB_OUTPUT"
+
       - name: Compute image metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ${{ env.IMAGE }}
+          images: ${{ steps.registries.outputs.images }}
           tags: |
             type=semver,pattern={{version}},value=${{ steps.ref.outputs.tag }}
             type=semver,pattern={{major}}.{{minor}},value=${{ steps.ref.outputs.tag }}
@@ -69,6 +104,7 @@ jobs:
             type=raw,value=latest
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
@@ -82,3 +118,148 @@ jobs:
             BUILD_REVISION=${{ steps.ref.outputs.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify the digest is identical in every registry
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ steps.ref.outputs.version }}
+          IMAGES: ${{ steps.registries.outputs.images }}
+        run: |
+          set -euo pipefail
+          for image in ${IMAGES}; do
+            got="$(docker buildx imagetools inspect "${image}:${VERSION}" --format '{{.Manifest.Digest}}')"
+            echo "${image}:${VERSION} -> ${got}"
+            if [ "${got}" != "${DIGEST}" ]; then
+              echo "::error::${image}:${VERSION} resolves to ${got} but the build pushed ${DIGEST}; the registries disagree. Stopping before any game-version tag is created." >&2
+              exit 1
+            fi
+          done
+
+      - name: Read the game version from the pushed image
+        id: game
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          ref="${GHCR_IMAGE}@${DIGEST}"
+          docker pull -q "${ref}"
+          cid="$(docker create "${ref}")"
+          docker cp "${cid}:/app/Server.jar" ./Server.jar
+          docker rm "${cid}" >/dev/null
+          game="$(python3 scripts/game-version.py ./Server.jar)"
+          rm -f ./Server.jar
+          case "${game}" in
+            *.*.*) minor="${game%.*}" ;;
+            *)     minor="${game}" ;;
+          esac
+          echo "Game version in ${ref}: ${game} (floating minor tag ${minor})"
+          echo "version=${game}" >>"$GITHUB_OUTPUT"
+          echo "minor=${minor}" >>"$GITHUB_OUTPUT"
+
+      - name: Push the game-version tags
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ steps.ref.outputs.version }}
+          IMAGES: ${{ steps.registries.outputs.images }}
+          GAME: ${{ steps.game.outputs.version }}
+          GAME_MINOR: ${{ steps.game.outputs.minor }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # Digest a tag currently resolves to; empty when the tag does not exist; any other failure is fatal.
+          resolve() {
+            if out="$(docker buildx imagetools inspect "$1" --format '{{.Manifest.Digest}}' 2>&1)"; then
+              printf '%s' "${out}"
+              return 0
+            fi
+            case "${out}" in
+              *"not found"*|*MANIFEST_UNKNOWN*|*NAME_UNKNOWN*) return 0 ;;
+            esac
+            echo "::error::cannot inspect $1: ${out}" >&2
+            exit 1
+          }
+
+          pin="${VERSION}-${GAME}"
+          floating="${GAME}"
+          if [ "${GAME_MINOR}" != "${GAME}" ]; then
+            floating="${floating} ${GAME_MINOR}"
+          fi
+
+          if [ "${EVENT}" = "push" ]; then
+            mode="release"
+          elif [ -z "$(resolve "${GHCR_IMAGE}:${GAME}")" ]; then
+            mode="new game version"
+          else
+            mode="unchanged"
+          fi
+          echo "Game ${GAME} on ${EVENT}: ${mode}"
+
+          case "${mode}" in
+            unchanged)
+              echo "::notice::Game version ${GAME} is already published; the floating game-version tags stay where they are."
+              # A registry that joined later (Docker Hub) still gets the digests GHCR already has for these tags.
+              for image in ${IMAGES}; do
+                [ "${image}" = "${GHCR_IMAGE}" ] && continue
+                for t in ${floating} ${pin}; do
+                  src="$(resolve "${GHCR_IMAGE}:${t}")"
+                  [ -n "${src}" ] || continue
+                  if [ "$(resolve "${image}:${t}")" != "${src}" ]; then
+                    docker buildx imagetools create -t "${image}:${t}" "${GHCR_IMAGE}@${src}"
+                    echo "${image}:${t} -> ${src} (copied from GHCR)"
+                  fi
+                done
+              done
+              ;;
+            *)
+              for image in ${IMAGES}; do
+                existing="$(resolve "${image}:${pin}")"
+                if [ -n "${existing}" ] && [ "${existing}" != "${DIGEST}" ]; then
+                  echo "::error::${image}:${pin} already exists at ${existing}; that tag is immutable and is not moved to ${DIGEST}." >&2
+                  exit 1
+                fi
+                set -- "${image}@${DIGEST}"
+                for t in ${floating} ${pin}; do
+                  set -- -t "${image}:${t}" "$@"
+                done
+                docker buildx imagetools create "$@"
+                echo "${image}: ${floating} ${pin} -> ${DIGEST}"
+              done
+              ;;
+          esac
+
+          {
+            echo "### ${GHCR_IMAGE#ghcr.io/} ${VERSION} (game ${GAME})"
+            echo
+            echo "| Registry | Tag | Digest |"
+            echo "| --- | --- | --- |"
+            for image in ${IMAGES}; do
+              for t in "${VERSION}" ${floating} "${pin}" latest; do
+                echo "| ${image} | ${t} | $(resolve "${image}:${t}") |"
+              done
+            done
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Compose the Docker Hub overview from README.md
+        if: steps.registries.outputs.hub == 'true'
+        run: |
+          set -euo pipefail
+          # Docker Hub accepts at most 25,000 bytes; the overview is the README down to the marker.
+          awk '/<!-- docker-hub-overview-ends-here -->/ { exit } { print }' README.md > hub-overview.md
+          printf '\n---\n\nThis page is the top of the repository README. The full documentation (environment variables, secrets, Workshop mods, data and permissions, troubleshooting) is at https://github.com/%s#readme.\n' "${GITHUB_REPOSITORY}" >> hub-overview.md
+          size="$(wc -c < hub-overview.md)"
+          echo "Docker Hub overview: ${size} bytes"
+          if [ "${size}" -gt 25000 ]; then
+            echo "::error::hub-overview.md is ${size} bytes; Docker Hub accepts 25000 at most. Move the docker-hub-overview-ends-here marker up in README.md." >&2
+            exit 1
+          fi
+
+      - name: Sync the Docker Hub description
+        if: steps.registries.outputs.hub == 'true'
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.HUB_REPOSITORY }}
+          short-description: "Necesse dedicated server: official SteamCMD base, bundled JRE, saves on stop, Workshop mod collections."
+          readme-filepath: ./hub-overview.md
+          enable-url-completion: true
