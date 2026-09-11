@@ -5,19 +5,38 @@ server; it is for the curious and for anyone debugging one.
 
 ## What is inside the image
 
-- **Base image `ghcr.io/steamcmd/steamcmd:debian-13`**, the official SteamCMD image, rebuilt
-  daily upstream. The Necesse server is installed from Steam (app `1169370`) at build time, so a
-  fresh container starts warm; `UPDATE_ON_START=true` refreshes it at every start.
-- **No distro Java.** The Steam build of the server ships its own JRE (`jre/bin/java`, currently
-  Temurin 17); `Server.jar` runs under that, so there is no JVM-version drift between the image and
-  the game. `JAVA_BIN` overrides the path.
-- **amd64 only.**
-- **One build, two registries.** Every release is pushed to GHCR and Docker Hub from a single
-  build, so a tag has the same digest on both. The publish workflow verifies that after the push
-  and stops before any further tagging if the registries disagree. All GitHub Actions are pinned by
-  commit SHA; Dependabot tracks both.
+- **Base image `eclipse-temurin:17-jre-noble`** (Ubuntu 24.04 with the Temurin 17 JRE), itself a
+  manifest list, so one Dockerfile builds `linux/amd64` and `linux/arm64`. `Server.jar` runs under
+  that JRE (`/opt/java/openjdk/bin/java`; `JAVA_BIN` overrides the path). The only package added on
+  top is `gosu`.
+- **Game files from Steam through DepotDownloader.** The Necesse server (app `1169370`) is fetched
+  at build time with Steam's anonymous dedicated-server access, natively on the platform doing the
+  build, and the result is shared by both architectures: Steam's Linux build carries an x86-64 JRE
+  (`jre/`) and x86-64 Steamworks natives (`linux64/`), and neither is downloaded, on either
+  architecture (filelist `regex:^(?!jre/|linux64/).*$`). The server then logs `Natives path:
+  INTERNAL` and loads its natives from `Server.jar`, which is how the developer's own Linux server
+  zip runs. Everything else under `/app` is byte for byte what SteamCMD installed before 2.5.0.
+  `UPDATE_ON_START=true` runs the same fetch at every start (`-validate` re-checks the files in
+  place). DepotDownloader (GPL-2.0) is an unmodified official release binary, fetched by pinned
+  version and sha256 in the Dockerfile and kept in the image at `/opt/depotdownloader/`; see
+  [NOTICE](../NOTICE). It runs as the `necesse` user, keeps per-directory state in
+  `<dir>/.DepotDownloader/` and its (anonymous) account settings under
+  `/home/necesse/.local/share/IsolatedStorage`, none of it inside the bind mount.
+- **Update detection.** `/app/.necesse-manifests` records the depot manifests installed in `/app`
+  (written by the build and after every successful download). The auto-update monitor runs a
+  DepotDownloader `-manifest-only` check into a scratch directory (manifests only, no game files)
+  and compares; a difference is logged as `Auto-update: new build detected (local ..., remote ...)`,
+  after which the server is stopped through the console (saving the world), refetched and
+  relaunched.
+- **One build, two platforms, two registries.** Every release is built for both platforms from one
+  amd64 runner (the fetch stages run natively; only the arm64 runtime stage's `apt-get` runs under
+  QEMU) and pushed to GHCR and Docker Hub as manifest lists, so a tag has the same digest on both.
+  The publish workflow verifies that every tag covers both platforms and that the digests agree, and
+  stops before any further tagging otherwise. All GitHub Actions are pinned by commit SHA; Dependabot
+  tracks the actions and the base image (the DepotDownloader version is a Dockerfile `ARG`, bumped by
+  hand together with its checksums).
 - **Health check:** exec-form `pgrep -f Server.jar`, interval 30 s, start period 30 s, 3 retries.
-  The container is unhealthy while SteamCMD and the Workshop fetch run and healthy after
+  The container is unhealthy while DepotDownloader and the Workshop fetch run and healthy after
   `Started server`.
 
 ## Graceful stop
@@ -89,14 +108,16 @@ nothing happens: no Steam call, `mods/` untouched, no new log lines.
   start with no such file yet is governed by `MODS_FAIL_FAST`. Definite negative answers (a
   non-numeric id, an API result other than success, a collection with zero file items) are refused
   even when a cache exists.
-- **Fetch and layout.** Each id is downloaded with an anonymous SteamCMD login
-  (`workshop_download_item 1169040 <id>`). SteamCMD exits 0 even on failure, so success is the
-  literal `Success. Downloaded item <id> to` line. The single `.jar` the item contains is copied
-  into `data/mods/` as **`ws-<id>-<OriginalName>.jar`**, mode `0600`, owned by `PUID:PGID`. The
-  game loads bare jars from that directory; the Workshop's own `content/<id>/` layout is not
-  loadable, and the download lands outside the bind mount, which is why the jar is copied rather
-  than linked. An unchanged item is revalidated (about 6 s) and the copy is left as it is; a
-  changed one replaces the copy. Expect roughly 10 s per item on a fresh container.
+- **Fetch and layout.** Each id is downloaded anonymously with DepotDownloader
+  (`-app 1169040 -pubfile <id>`) into a fresh directory of its own outside the bind mount.
+  DepotDownloader exits 0 even when the item does not exist, so success is the `Total downloaded:`
+  line it prints after a completed download; on failure the last line of its output is the reason
+  (`Unable to locate manifest ID for published file <id>` for a bad id). The single `.jar` the item
+  contains is copied into `data/mods/` as **`ws-<id>-<OriginalName>.jar`**, mode `0600`, owned by
+  `PUID:PGID`. The game loads bare jars from that directory, and the download lands outside the bind
+  mount, which is why the jar is copied rather than linked. An unchanged item is fetched again (a few
+  seconds; mods are small) and the copy is left as it is when identical; a changed one replaces the
+  copy.
 - **Managed vs. your own jars.** Only files named `ws-<id>-*.jar` are managed. When an id is no
   longer listed (removed from the collection or from `MODS_WORKSHOP`), its `ws-` jar is deleted on
   the next start (`removing <jar> (item <id> is no longer listed)`), the only deletion the
@@ -113,11 +134,13 @@ nothing happens: no Steam call, `mods/` untouched, no new log lines.
   starts with the `MODS_WORKSHOP` ids only).
 - **`data/ws-manifest.txt`** (beside `mods/`, not inside it: the game warns about every non-jar
   file in `mods/`) is rewritten after each fetch, one tab-separated line per listed id: the id, the
-  jar name, the Workshop `manifest` and `timeupdated` values from SteamCMD's
-  `appworkshop_1169040.acf`, and `status=ok|failed`. That is how you tell which revision of a mod
-  is live. Anonymous SteamCMD always fetches the item's current revision; the copied jar is the
-  only pin, so an author update is picked up on the next container start (the running server
-  keeps the jar it loaded).
+  jar name, the item's Workshop `manifest` and `timeupdated` values, and `status=ok|failed`. That is
+  how you tell which revision of a mod is live. The two values come from Steam's public
+  `GetPublishedFileDetails` endpoint (`hcontent_file` and `time_updated`; one request for all listed
+  ids, no key, no login); if that request fails the fetch still runs and both read `-`. The
+  anonymous fetch always takes the item's current revision; the copied jar is the only pin, so an
+  author update is picked up on the next container start (the running server keeps the jar it
+  loaded).
 - **Not compatible with `LOCAL_DIR=1`.** With `-localdir` the game reads mods from `/app/mods`
   inside the image, where they would not survive a recreate; the entrypoint refuses that
   combination and exits.

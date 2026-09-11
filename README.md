@@ -33,10 +33,11 @@ services:
 docker compose up -d
 ```
 
-The first start downloads the server from Steam, which takes a minute or two.
-`docker compose logs -f` shows the progress and ends with `Started server ...`. Your world,
-config and logs live in `./data`. The same image is on Docker Hub as
-`stargumbo/necesse-server:2`.
+The server files are already in the image, so the first start takes seconds;
+`docker compose logs -f` ends with `Started server ...`. Your world, config and logs live in
+`./data`. The same image is on Docker Hub as `stargumbo/necesse-server:2`. It runs on amd64 and
+arm64 alike: an x86 server, a Raspberry Pi 5, an Ampere or Graviton VM and Docker Desktop on
+Apple Silicon all pull the right image from that one tag.
 
 ## Your world is safe
 
@@ -68,8 +69,8 @@ world before it restarts. Pick the tag that matches how much you want to move:
 | Tag | Use it when |
 | --- | --- |
 | `2` | you want fixes and rebuilds without breaking changes (recommended) |
-| `2.4.0-1.3.3` | you want a pin that **never moves** |
-| `2.4.0` | you want that release, refreshed weekly while it is the newest |
+| `2.5.0-1.3.3` | you want a pin that **never moves** |
+| `2.5.0` | you want that release, refreshed weekly while it is the newest |
 | `1.3.3` | you want the newest image built for that game version |
 | `latest` | you want whatever is newest |
 
