@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on 
 
 ## [Unreleased]
 
+### Changed
+- The Docker Hub overview is synced from `README.md` on `main` by its own workflow
+  (`.github/workflows/hub-readme.yml`) whenever the README changes, and on manual dispatch. The
+  publish workflow no longer syncs it from the tag being built, so a weekly rebuild of an older tag
+  can no longer replace the Hub page with that tag's README. Docs reach Hub when they merge; no image
+  is built and no tag moves. The Hub short description is shortened to fit Hub's 100-character limit.
+
 ## [2.4.0] - 2026-09-10
 
 A migration release: someone running a Necesse container from another image can try this one by

@@ -1,0 +1,71 @@
+name: Docker Hub README
+
+# The Docker Hub overview of docker.io/stargumbo/necesse-server is the top of README.md on main, down to the
+# docker-hub-overview-ends-here marker. This workflow is its only writer: it runs when README.md changes on
+# main (or on manual dispatch), checks out main, and syncs the overview and short description. It builds
+# nothing, pushes no image, and moves no tag; publish.yml no longer touches the overview, so the Hub page
+# can never regress to the README of whichever tag was last rebuilt.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - README.md
+      - .github/workflows/hub-readme.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hub-readme
+  cancel-in-progress: false
+
+env:
+  HUB_REPOSITORY: stargumbo/necesse-server
+  # Secrets cannot be tested in `if:` directly, so the username is copied into the environment.
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+
+      - name: Require the Docker Hub secrets
+        run: |
+          set -euo pipefail
+          # Unlike publish.yml, this workflow has nothing else to do, so a missing secret is a failure, not a skip.
+          if [ -z "${DOCKERHUB_USERNAME}" ]; then
+            echo "::error::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN repository secrets are not set; the Docker Hub overview cannot be synced." >&2
+            exit 1
+          fi
+
+      - name: Compose the Docker Hub overview from README.md
+        run: |
+          set -euo pipefail
+          # Docker Hub accepts at most 25,000 bytes; the overview is the README down to the marker.
+          awk '/<!-- docker-hub-overview-ends-here -->/ { exit } { print }' README.md > hub-overview.md
+          printf '\n---\n\nThis page is the top of the repository README. The full documentation (environment variables, secrets, Workshop mods, data and permissions, troubleshooting) is at https://github.com/%s#readme.\n' "${GITHUB_REPOSITORY}" >> hub-overview.md
+          size="$(wc -c < hub-overview.md)"
+          echo "Docker Hub overview: ${size} bytes from README.md at $(git rev-parse --short HEAD)"
+          if [ "${size}" -gt 25000 ]; then
+            echo "::error::hub-overview.md is ${size} bytes; Docker Hub accepts 25000 at most. Move the docker-hub-overview-ends-here marker up in README.md." >&2
+            exit 1
+          fi
+
+      - name: Sync the Docker Hub description
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.HUB_REPOSITORY }}
+          # Docker Hub truncates the short description at 100 characters; keep this under it.
+          short-description: "Necesse dedicated server: SteamCMD base, bundled JRE, saves on stop, Workshop mod collections."
+          readme-filepath: ./hub-overview.md
+          # The banner is already an absolute raw.githubusercontent.com URL; url completion is for the relative
+          # links to LICENSE, CHANGELOG.md, docker-compose.yml and docs/, which Hub would otherwise render dead.
+          enable-url-completion: true
