@@ -249,11 +249,13 @@ docker compose up -d
   1. Update [`CHANGELOG.md`](../CHANGELOG.md) and documentation.
   2. `git tag -a vX.Y.Z -m "vX.Y.Z"` and `git push --follow-tags`.
   3. `.github/workflows/publish.yml` builds once and pushes `ghcr.io/stargumbo/necesse-server` and
-     `docker.io/stargumbo/necesse-server` with the tags listed under Tags, then syncs the Docker
-     Hub overview from the README (see [Docker Hub overview](DOCKER_HUB_OVERVIEW.md)). The same
-     workflow can be dispatched manually to rebuild the newest tag. Docker Hub publishing needs the
+     `docker.io/stargumbo/necesse-server` with the tags listed under Tags. The same workflow can be
+     dispatched manually to rebuild the newest tag. Docker Hub publishing needs the
      `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets (a Hub access token, never a
      password); without them the workflow publishes to GHCR only and says so in its log.
+- The Docker Hub overview is independent of releases: `.github/workflows/hub-readme.yml` syncs it
+  from `README.md` on `main` whenever the README changes (see
+  [Docker Hub overview](DOCKER_HUB_OVERVIEW.md)); it uses the same two secrets.
 
 ## Links
 

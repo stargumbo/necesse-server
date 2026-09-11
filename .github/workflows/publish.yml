@@ -12,7 +12,8 @@ name: Publish
 #                        (i.e. :<game> does not exist yet); :X.Y.Z-<game> is never re-pointed once it exists.
 #
 # The game version is read from Server.jar inside the image that was just pushed (scripts/game-version.py);
-# nothing is hard-coded. This workflow never changes the image itself.
+# nothing is hard-coded. This workflow never changes the image itself, and it does not touch the Docker Hub
+# overview: that is synced from README.md on main by hub-readme.yml, never from the tag being built.
 on:
   push:
     tags:
@@ -28,7 +29,6 @@ permissions:
 env:
   GHCR_IMAGE: ghcr.io/${{ github.repository }}
   HUB_IMAGE: docker.io/stargumbo/necesse-server
-  HUB_REPOSITORY: stargumbo/necesse-server
   # Secrets cannot be tested in `if:` directly, so the username is copied into the environment; every
   # Docker Hub step is skipped (with a notice) while it is empty and GHCR publishing is unaffected.
   DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -88,10 +88,8 @@ jobs:
           images="${GHCR_IMAGE}"
           if [ -n "${DOCKERHUB_USERNAME}" ]; then
             images="${images}"$'\n'"${HUB_IMAGE}"
-            echo "hub=true" >>"$GITHUB_OUTPUT"
           else
             echo "::notice::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN are not set; publishing to GHCR only."
-            echo "hub=false" >>"$GITHUB_OUTPUT"
           fi
           { echo "images<<EOF"; echo "${images}"; echo "EOF"; } >>"$GITHUB_OUTPUT"
 
@@ -241,28 +239,3 @@ jobs:
               done
             done
           } >>"$GITHUB_STEP_SUMMARY"
-
-      - name: Compose the Docker Hub overview from README.md
-        if: steps.registries.outputs.hub == 'true'
-        run: |
-          set -euo pipefail
-          # Docker Hub accepts at most 25,000 bytes; the overview is the README down to the marker.
-          awk '/<!-- docker-hub-overview-ends-here -->/ { exit } { print }' README.md > hub-overview.md
-          printf '\n---\n\nThis page is the top of the repository README. The full documentation (environment variables, secrets, Workshop mods, data and permissions, troubleshooting) is at https://github.com/%s#readme.\n' "${GITHUB_REPOSITORY}" >> hub-overview.md
-          size="$(wc -c < hub-overview.md)"
-          echo "Docker Hub overview: ${size} bytes"
-          if [ "${size}" -gt 25000 ]; then
-            echo "::error::hub-overview.md is ${size} bytes; Docker Hub accepts 25000 at most. Move the docker-hub-overview-ends-here marker up in README.md." >&2
-            exit 1
-          fi
-
-      - name: Sync the Docker Hub description
-        if: steps.registries.outputs.hub == 'true'
-        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: ${{ env.HUB_REPOSITORY }}
-          short-description: "Necesse dedicated server: official SteamCMD base, bundled JRE, saves on stop, Workshop mod collections."
-          readme-filepath: ./hub-overview.md
-          enable-url-completion: true
