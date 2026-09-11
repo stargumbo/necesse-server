@@ -11,7 +11,7 @@
 #   IMAGE=... tests/run-fixtures.sh keep filecfg               same for karyeet-style with file-mounted cfg
 #   tests/run-fixtures.sh clean                                stop and remove what this script created
 #
-# Environment: IMAGE (image under test), BASELINE_IMAGE (default ghcr.io/stargumbo/necesse-server:2.3.0;
+# Environment: IMAGE (image under test), BASELINE_IMAGE (default ghcr.io/stargumbo/necesse-server:2.4.0;
 # produces the world saves and is the log-diff reference), RIG (scratch directory), HOST_NET=1 (WSL2:
 # bind the host's 14159 directly, bridge-published UDP does not reach a Windows client), PASSWORD
 # (join password used throughout), MODS_COLLECTION (set on the karyeet-style fixture when given),
@@ -19,7 +19,7 @@
 set -euo pipefail
 
 IMAGE="${IMAGE:-necesse-server:dev}"
-BASELINE_IMAGE="${BASELINE_IMAGE:-ghcr.io/stargumbo/necesse-server:2.3.0}"
+BASELINE_IMAGE="${BASELINE_IMAGE:-ghcr.io/stargumbo/necesse-server:2.4.0}"
 RIG="${RIG:-${HOME}/necesse-24-rig}"
 HOST_NET="${HOST_NET:-0}"
 PASSWORD="${PASSWORD:-Fixture-Pass-9f3k}"
@@ -27,6 +27,9 @@ MODS_COLLECTION="${MODS_COLLECTION:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 FIXTURES="${HERE}/fixtures"
 DATADIR=/home/necesse/.config/Necesse
+# The java in the launch command: /app/jre/bin/java up to 2.4.0 (the JRE from the Steam build), the base
+# image's JRE since 2.5.0. Both are accepted so the baseline image and the image under test can differ.
+JAVA_RE='(/app/jre/bin/java|/opt/java/openjdk/bin/java)'
 PASS=0
 FAIL=0
 
@@ -70,7 +73,7 @@ wait_healthy() {
 # Timestamps, ANSI colours, ephemeral ports/addresses and world-generation randomness (region load
 # order, spawn tile) removed, so two runs can be diffed.
 normalize_log() {
-    sed -E 's/\x1b\[[0-9;]*m//g; s/\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8}\] //; s|logs/[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9hms]+\.txt|logs/<timestamp>.txt|; /Started lan socket at port/d; /Local address:/d; /^[0-9]{4}-[0-9]{2}-[0-9]{2} /d; /Starting to load level presets region/d; /Found spawn tile at/d'
+    sed -E "s#^  ${JAVA_RE} #  <java> #" | sed -E 's/\x1b\[[0-9;]*m//g; s/\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8}\] //; s|logs/[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9hms]+\.txt|logs/<timestamp>.txt|; /Started lan socket at port/d; /Local address:/d; /^[0-9]{4}-[0-9]{2}-[0-9]{2} /d; /Starting to load level presets region/d; /Found spawn tile at/d'
 }
 
 # world_zip <name>: path of a saved world zip with that name, produced once by the baseline image.
@@ -134,7 +137,7 @@ case_aliases() {
         -e SLOTS=7 -e "MOTD=alias motd" -e PAUSE=1 -e GIVE_CLIENTS_POWER=1 -e JVMARGS=-Xmx1G "${IMAGE}" >/dev/null
     wait_for n24-alias-b "Started server" || true
     L="$(logs n24-alias-b)"
-    grep -E '^WARN|^  /app' <<<"${L}" | sed 's|^  /app/jre/bin/java|  <java>|'
+    grep -E '^WARN|^  /(app|opt)' <<<"${L}" | sed -E "s#^  ${JAVA_RE}#  <java>#"
     check "exactly 7 alias WARN lines (GIVE_CLIENTS_POWER is already canonical)" \
         [ "$(grep -c '^WARN: .* is accepted as an alias of ' <<<"${L}")" -eq 7 ]
     local pair
@@ -142,7 +145,7 @@ case_aliases() {
         check "  WARN for ${pair%%:*} names ${pair#*:}" grep -q "^WARN: ${pair%%:*} is accepted as an alias of ${pair#*:} " <<<"${L}"
     done
     check "  argv carries the alias values" grep -qE -- '-world +AliasWorld .*-slots +7 .*-owner +AliasOwner .*-motd +alias motd .*-pausewhenempty +1 .*-giveclientspower +1' <<<"${L}"
-    check "  JVMARGS reached the JVM command line" grep -qE -- '^  /app/jre/bin/java +-Xmx1G +-jar' <<<"${L}"
+    check "  JVMARGS reached the JVM command line" grep -qE -- "^  ${JAVA_RE} +-Xmx1G +-jar" <<<"${L}"
     check "  server started" grep -q "Started server using port 14159 with 7 slots" <<<"${L}"
     check "  cfg holds the aliased password" docker exec n24-alias-b grep -q "password = ${PASSWORD}," "${DATADIR}/cfg/server.cfg"
     password_hidden n24-alias-b "${L}"
@@ -154,13 +157,13 @@ case_aliases() {
         -e slots=7 -e "MOTD=alias motd" -e pauseWhenEmpty=true -e giveClientsPower=true -e JVM_OPTS=-Xmx1G "${IMAGE}" >/dev/null
     wait_for n24-alias-k "Started server" || true
     L="$(logs n24-alias-k)"
-    grep -E '^WARN|^  /app' <<<"${L}" | sed 's|^  /app/jre/bin/java|  <java>|'
+    grep -E '^WARN|^  /(app|opt)' <<<"${L}" | sed -E "s#^  ${JAVA_RE}#  <java>#"
     check "exactly 8 alias WARN lines" [ "$(grep -c '^WARN: .* is accepted as an alias of ' <<<"${L}")" -eq 8 ]
     for pair in world:WORLD_NAME password:SERVER_PASSWORD owner:SERVER_OWNER slots:SERVER_SLOTS MOTD:SERVER_MOTD pauseWhenEmpty:PAUSE_WHEN_EMPTY giveClientsPower:GIVE_CLIENTS_POWER JVM_OPTS:JAVA_OPTS; do
         check "  WARN for ${pair%%:*} names ${pair#*:}" grep -q "^WARN: ${pair%%:*} is accepted as an alias of ${pair#*:} " <<<"${L}"
     done
     check "  argv carries the alias values" grep -qE -- '-world +AliasWorld .*-slots +7 .*-owner +AliasOwner .*-motd +alias motd .*-pausewhenempty +true .*-giveclientspower +true' <<<"${L}"
-    check "  JVM_OPTS reached the JVM command line" grep -qE -- '^  /app/jre/bin/java +-Xmx1G +-jar' <<<"${L}"
+    check "  JVM_OPTS reached the JVM command line" grep -qE -- "^  ${JAVA_RE} +-Xmx1G +-jar" <<<"${L}"
     check "  server started" grep -q "Started server using port 14159 with 7 slots" <<<"${L}"
     check "  cfg holds the aliased password" docker exec n24-alias-k grep -q "password = ${PASSWORD}," "${DATADIR}/cfg/server.cfg"
     password_hidden n24-alias-k "${L}"

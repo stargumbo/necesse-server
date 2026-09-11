@@ -2,14 +2,86 @@
 
 All notable changes to this project are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.5.0] - 2026-09-11
+
+The image now runs on `linux/arm64` as well as `linux/amd64`: every tag is a manifest list, so a
+Raspberry Pi 5, an Ampere or Graviton VM, or Docker Desktop on Apple Silicon pulls the right image
+from the same `ghcr.io/stargumbo/necesse-server:2`. To get there, the game files are fetched from
+Steam by DepotDownloader instead of SteamCMD, on both architectures, at build time and at run time.
+The environment contract, the `MODS_*` surface (frozen at 2.3.0), the stop path and the data layout
+are unchanged, and there is no architecture-specific variable. On amd64 a running server sees no
+behaviour change beyond the acquirer: the game files under `/app` are byte for byte those of 2.4.0
+(67 files, Server.jar sha256 `83e08ad78ceb…`, game 1.3.3) minus Steam's `jre/` and `linux64/`,
+and the image shrinks from 389 MB to 189 MB uncompressed.
+
+### Added
+- `linux/arm64` images, published together with `linux/amd64` as manifest lists on GHCR and Docker
+  Hub for every tag (`2.5.0`, `2.5`, `2`, `latest`, `2.5.0-<game>`, `<game>`, `<game major.minor>`).
+  The publish workflow verifies that every tag covers both platforms and resolves to the same
+  manifest-list digest on both registries before any game-version tag is created, and lists the
+  per-platform digests in its summary (`.github/workflows/publish.yml`).
+- `.github/workflows/arm64.yml`: on every pull request and push to `main` the image is built
+  natively on a GitHub `ubuntu-24.04-arm` runner and checked with `tests/run-platform.sh` on real
+  arm64 hardware, console stop included. It grew out of the phase-1 smoke gate, which proved that
+  the runner schedules for this repository and that the stop path is clean on arm64 hardware: the
+  failure to exit after `stop` seen under qemu-user is an emulator artifact (see the arm64 notes in
+  `docs/reference.md`), and no stop or socket-close check runs under emulation anywhere in CI.
+- `tests/run-platform.sh`: the architecture-independent suite (image contents, boot, world load,
+  console FIFO and helper, password path, healthcheck, `UPDATE_ON_START`, the auto-update restart,
+  `MODS_WORKSHOP`, `MODS_COLLECTION`, console stop), run by CI on amd64 and by the arm64 workflow on
+  arm64 against the same Dockerfile.
+- `NOTICE` (in the image at `/usr/share/doc/necesse-server/NOTICE`): DepotDownloader 3.4.0,
+  GPL-2.0, source and release URLs. The Dockerfile pins the release by version and by the sha256 of
+  each architecture's zip and records them; the binary's own `LICENSE` and a `RELEASE.txt` (asset,
+  URL, verified sha256) sit next to it under `/opt/depotdownloader/`.
+- CI builds the two-platform image the way the publish workflow does (`cross-build` job in
+  `.github/workflows/ci.yml`), so a release is never the first cross-build.
 
 ### Changed
+- Game files are fetched by DepotDownloader (anonymous dedicated-server access, app `1169370`)
+  instead of SteamCMD: at build time, natively on the platform doing the build (the result is
+  shared by both architectures), and at run time for `UPDATE_ON_START`, `AUTO_UPDATE_INTERVAL_MINUTES`
+  and the Workshop mods. `-validate` re-checks the files in place as `app_update ... validate` did.
+  The log lines read `Running DepotDownloader to install or update Necesse (anonymous, app 1169370)...`
+  and `DepotDownloader run complete.` where they named SteamCMD before.
+- Base image `eclipse-temurin:17-jre-noble` (Ubuntu 24.04, Temurin 17 JRE) instead of
+  `ghcr.io/steamcmd/steamcmd:debian-13`; `gosu` is the only package added on top. The server runs
+  under that JRE: `JAVA_BIN` defaults to `/opt/java/openjdk/bin/java` instead of `/app/jre/bin/java`
+  from the Steam build, and the `Starting Necesse server with command:` line shows that path. Steam's
+  `jre/` (an x86-64 JRE) and `linux64/` (x86-64 Steamworks natives) are not downloaded on either
+  architecture; the server logs `Natives path: INTERNAL` and loads its natives from `Server.jar`, as
+  the developer's own Linux server zip does.
+- Update detection uses a DepotDownloader `-manifest-only` check: the depot manifests installed in
+  `/app` are recorded in `/app/.necesse-manifests` (by the image build and after every successful
+  download) and compared with what Steam serves; `Auto-update: new build detected (local ..., remote
+  ...)` names manifests instead of a build id. Same semantics, same restart path (console `stop`,
+  save, refetch, relaunch).
+- Workshop items are fetched with `DepotDownloader -app 1169040 -pubfile <id>` into a fresh per-item
+  directory outside the bind mount; the managed-jar layout, prefix-only deletion and the
+  `ws-manifest.txt` format are unchanged. The `manifest` and `timeupdated` values in
+  `ws-manifest.txt` now come from Steam's public `GetPublishedFileDetails` endpoint (one request for
+  all listed items) instead of SteamCMD's `appworkshop_1169040.acf`; if that request fails the fetch
+  still runs and both fields read `-`. A nonexistent item is reported as `Unable to locate manifest
+  ID for published file <id>` instead of `File Not Found`.
+- The weekly rebuild passes a fresh `STEAM_REFRESH` build argument so the game files are fetched
+  again even when the base image did not change (with SteamCMD the daily-rebuilt base did that job).
 - The Docker Hub overview is synced from `README.md` on `main` by its own workflow
   (`.github/workflows/hub-readme.yml`) whenever the README changes, and on manual dispatch. The
   publish workflow no longer syncs it from the tag being built, so a weekly rebuild of an older tag
   can no longer replace the Hub page with that tag's README. Docs reach Hub when they merge; no image
-  is built and no tag moves. The Hub short description is shortened to fit Hub's 100-character limit.
+  is built and no tag moves. The Hub short description is shortened to fit Hub's 100-character limit
+  and names both architectures.
+- README: the platforms under "Running in 60 seconds", tag examples; `docs/reference.md`: platforms
+  in the tag table, an "arm64 notes" section (what is the same, what to expect under emulation),
+  updated `UPDATE_ON_START` / `JAVA_BIN` rows and troubleshooting; `docs/internals.md`: what is
+  inside the image, update detection and the Workshop fetch, rewritten for the acquirer change.
+  `tests/run-fixtures.sh` accepts either JRE path in the launch command and diffs against 2.4.0.
+
+### Removed
+- SteamCMD, its base image, `/steamapps/update_necesse.txt` and the per-user SteamCMD state under
+  `/home/necesse/.local/share/Steam` (its `logs/stderr.txt` no longer exists; DepotDownloader's
+  output is in `docker logs`). The `Bundled JRE not found` message is now `Java runtime not found at
+  ...`, seen only when `JAVA_BIN` points at a path that does not exist in this image.
 
 ## [2.4.0] - 2026-09-10
 

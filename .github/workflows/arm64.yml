@@ -1,0 +1,78 @@
+name: arm64
+
+# The image's linux/arm64 checks on a GitHub-hosted arm64 runner: real hardware, not QEMU. The Dockerfile is
+# built natively here, so DepotDownloader's arm64 binary fetches the game files on arm64, and the same
+# tests/run-platform.sh that CI runs on amd64 runs against the result: what is in the image, boot and world
+# load, the console FIFO and helper, the password path, the healthcheck, UPDATE_ON_START, the auto-update
+# restart, MODS_WORKSHOP, MODS_COLLECTION and the console stop that saves the world.
+#
+# The stop check is why this job runs on hardware. Under qemu-user the server never exits after `stop`:
+# DatagramSocket.close fails with EINVAL in NativeThread.signal after the world save and the server falls
+# into a crash loop (an emulator artifact, absent on real arm64; see docs/reference.md, "arm64 notes"), so
+# no stop or socket-close check is ever run under emulation. This job grew out of the phase-1 arm64 smoke
+# gate (PR #4), which proved the runner schedules for this repository and the stop path is clean on arm64.
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fixtures-on-native-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Runner is native arm64
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          echo "uname -m: ${arch}; $(nproc) vCPU; kernel $(uname -r)"
+          grep -m1 -iE 'model name|CPU implementer' /proc/cpuinfo || true
+          free -h | sed -n 2p
+          if [ "${arch}" != "aarch64" ]; then
+            echo "::error::expected an aarch64 runner, got ${arch}; the ubuntu-24.04-arm label did not resolve to ARM hardware" >&2
+            exit 1
+          fi
+          # A qemu-user setup would register aarch64 in binfmt_misc on an x86 host; a native runner has no such entry.
+          if compgen -G '/proc/sys/fs/binfmt_misc/qemu-aarch64*' >/dev/null; then
+            echo "::error::qemu-aarch64 is registered in binfmt_misc; this is not a native arm64 host" >&2
+            exit 1
+          fi
+          echo "docker server arch: $(docker version --format '{{.Server.Arch}}')"
+
+      - name: Build the image natively on arm64
+        run: |
+          set -euo pipefail
+          docker build --pull -t necesse-server:arm64 .
+          docker image inspect necesse-server:arm64 --format 'image: {{.Os}}/{{.Architecture}}, {{.Size}} bytes uncompressed'
+
+      - name: Game version is detectable in the built image
+        run: |
+          set -euo pipefail
+          cid="$(docker create necesse-server:arm64)"
+          docker cp "${cid}:/app/Server.jar" ./Server.jar
+          docker rm "${cid}" >/dev/null
+          game="$(python3 scripts/game-version.py ./Server.jar)"
+          sha256sum ./Server.jar
+          rm -f ./Server.jar
+          echo "Game version in the built image: ${game}"
+
+      - name: Platform checks on real arm64 (boot, console, password, update, auto-update, mods, console stop)
+        run: IMAGE=necesse-server:arm64 tests/run-platform.sh
+
+      - name: Container logs (on failure)
+        if: failure()
+        run: |
+          for c in $(docker ps -a --filter name=npf- --format '{{.Names}}'); do
+            echo "::group::${c}"; docker logs "${c}" 2>&1 | tail -n 200; echo "::endgroup::"
+          done
+
+      - name: Clean up
+        if: always()
+        run: IMAGE=necesse-server:arm64 tests/run-platform.sh clean || true

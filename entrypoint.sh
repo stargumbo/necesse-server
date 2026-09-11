@@ -1,16 +1,26 @@
 #!/bin/sh
 set -eu
 
-# SteamCMD comes from the base image (ghcr.io/steamcmd/steamcmd): the `steamcmd` wrapper keeps
-# per-user state under $HOME/.local/share/Steam. STEAMCMD_DIR only holds the update runscript.
-STEAMCMD_DIR="/steamapps"
+# The game files come from Steam through DepotDownloader (anonymous dedicated-server access), the same
+# acquirer on amd64 and arm64, at build time and here. It is an unmodified official release binary (see
+# NOTICE); its per-directory state lives in <dir>/.DepotDownloader. Steam's Linux build also carries an
+# x86-64 JRE (jre/) and x86-64 Steamworks natives (linux64/); neither is downloaded, on either
+# architecture: the server runs under the image's own JRE and takes its natives from Server.jar
+# ("Natives path: INTERNAL"), as the developer's own Linux server zip does. The filelist rule below
+# says so, and it is the same one the Dockerfile uses at build time.
+DEPOTDOWNLOADER_BIN="/opt/depotdownloader/DepotDownloader"
+DEPOT_FILELIST="/tmp/necesse-depot-filelist"
+DEPOT_FILELIST_RULE='regex:^(?!jre/|linux64/).*$'
 APP_DIR="/app"
 APP_ID="1169370"
+# "<depot> <manifest>" per line: the depot manifests installed in APP_DIR, written by the image build and
+# after every successful download here; the auto-update check compares it with what Steam serves now.
+INSTALLED_MANIFESTS_FILE="${APP_DIR}/.necesse-manifests"
 RUN_USER="${CONTAINER_USER:-necesse}"
 RUN_GROUP="${CONTAINER_GROUP:-necesse}"
 RUN_HOME="/home/${RUN_USER}"
-# The Steam build of the dedicated server ships its own JRE (StartServer-nogui.sh uses ./jre/bin/java).
-JAVA_BIN="${JAVA_BIN:-${APP_DIR}/jre/bin/java}"
+# The image's JRE (Eclipse Temurin; JAVA_HOME is set by the base image). JAVA_BIN overrides it.
+JAVA_BIN="${JAVA_BIN:-${JAVA_HOME:-/opt/java/openjdk}/bin/java}"
 AUTO_UPDATE_FLAG_FILE="/tmp/necesse-auto-update"
 # The server only saves on the console `stop` command, not on SIGTERM (verified 2026-09-07: a plain
 # SIGTERM exits in <1s without a save). Its stdin is a FIFO held open by this script, so a stop
@@ -22,9 +32,10 @@ CONSOLE_FIFO="/tmp/necesse-console"
 # `console` helper (docker exec <container> console players) reads to show a command's reply.
 OUTPUT_FIFO="/tmp/necesse-output"
 STOP_TIMEOUT_SECONDS="${STOP_TIMEOUT_SECONDS:-50}"
-# Steam Workshop items are published under the client app id, not the dedicated server's.
+# Steam Workshop items are published under the client app id, not the dedicated server's. Each item is
+# downloaded into its own directory under WORKSHOP_DIR, outside the bind mount (as SteamCMD's were).
 WORKSHOP_APP_ID="1169040"
-WORKSHOP_STEAM_DIR="${RUN_HOME}/.local/share/Steam/steamapps/workshop"
+WORKSHOP_DIR="${RUN_HOME}/.local/share/necesse-workshop"
 
 SERVER_PID=""
 AUTO_UPDATE_MONITOR_PID=""
@@ -71,8 +82,7 @@ adjust_permissions() {
 
     chown -R "${RUN_USER}:${RUN_GROUP}" \
         "${APP_DIR}" \
-        "${RUN_HOME}" \
-        "${STEAMCMD_DIR}"
+        "${RUN_HOME}"
 }
 
 # The game's data directory as launch_server passes it: DATA_DIR when set, else the run user's default.
@@ -469,9 +479,9 @@ CFG
 #     are not locked out. Nested collections are not followed. A collection that resolves to no
 #     file items is refused: that is a wrong id, not a request to run unmodded.
 #   MODS_WORKSHOP: a comma-separated list of item ids, for people who do not want a collection.
-# Before the first server launch each id is fetched with an anonymous SteamCMD login and the single
-# jar it contains is copied FLAT into <datadir>/mods as ws-<id>-<OriginalName>.jar: the game only
-# loads bare jars from that directory, and SteamCMD's own download lands outside the bind mount,
+# Before the first server launch each id is fetched anonymously with DepotDownloader (-pubfile) and the
+# single jar it contains is copied FLAT into <datadir>/mods as ws-<id>-<OriginalName>.jar: the game
+# only loads bare jars from that directory, and the download itself lands outside the bind mount,
 # so it would vanish on recreate. Jars carrying the ws- prefix are managed: on every start the
 # ones whose id is no longer listed are deleted, and that is the only deletion this script ever
 # performs. Anything else in mods/ is left alone. Resolution and fetch run once per container
@@ -656,17 +666,34 @@ resolve_workshop_collection() {
     done
 }
 
-# One field of one item from the WorkshopItemsInstalled block of appworkshop_<app>.acf.
-workshop_acf_field() {
-    acf="${WORKSHOP_STEAM_DIR}/appworkshop_${WORKSHOP_APP_ID}.acf"
-    [ -f "${acf}" ] || return 0
-    awk -v id="$1" -v field="$2" -F'"' '
-        $2 == "WorkshopItemsInstalled" { installed = 1; next }
-        installed && $2 == "WorkshopItemDetails" { installed = 0 }
-        installed && !inside && $2 == id { inside = 1; next }
-        inside && $2 == field { print $4; exit }
-        inside && /^[[:space:]]*}/ { inside = 0 }
-    ' "${acf}"
+# The manifest and timeupdated values ws-manifest.txt shows per item come from Steam's public
+# GetPublishedFileDetails endpoint (no key, no login), one request for all listed ids. SteamCMD used
+# to record the same two values in appworkshop_<app>.acf; DepotDownloader keeps no such file. This is
+# metadata only: if the request fails the fetch still runs and the manifest carries "-" for both.
+WORKSHOP_DETAILS=""
+fetch_workshop_item_details() {
+    WORKSHOP_DETAILS=""
+    [ -n "${MODS_WORKSHOP_IDS}" ] || return 0
+    data="itemcount=$(printf '%s' "${MODS_WORKSHOP_IDS}" | wc -w | tr -d ' ')"
+    i=0
+    for id in ${MODS_WORKSHOP_IDS}; do
+        data="${data}&publishedfileids[${i}]=${id}"
+        i=$((i + 1))
+    done
+    if ! WORKSHOP_DETAILS="$(steam_api_post /ISteamRemoteStorage/GetPublishedFileDetails/v1/ "${data}")"; then
+        echo "Workshop mods: WARNING: could not read the item details from the Steam Web API ($(steam_api_error)); ws-manifest.txt will show - for manifest and timeupdated." >&2
+        WORKSHOP_DETAILS=""
+    fi
+}
+
+# One numeric field of one item from that response, e.g. workshop_detail <id> hcontent_file (the item's
+# manifest id, a quoted string) or workshop_detail <id> time_updated (a bare number). The item's entry
+# starts at its publishedfileid and ends where the next item's begins.
+workshop_detail() {
+    [ -n "${WORKSHOP_DETAILS}" ] || return 0
+    printf '%s' "${WORKSHOP_DETAILS}" | tr -d '\n' \
+        | sed -n "s/.*\"publishedfileid\":\"$1\",\(.*\)/\1/p" | sed 's/"publishedfileid":.*//' \
+        | grep -o "\"$2\":\"\{0,1\}[0-9][0-9]*" | head -n 1 | grep -o '[0-9]*$'
 }
 
 # ws-manifest.txt: one line per listed id so the operator can see which Workshop revision is live.
@@ -689,8 +716,8 @@ write_workshop_manifest() {
         case " ${failed_ids} " in
             *" ${id} "*) status="failed" ;;
         esac
-        item_manifest="$(workshop_acf_field "${id}" manifest)"
-        item_time="$(workshop_acf_field "${id}" timeupdated)"
+        item_manifest="$(workshop_detail "${id}" hcontent_file)"
+        item_time="$(workshop_detail "${id}" time_updated)"
         printf '%s\t%s\tmanifest=%s\ttimeupdated=%s\tstatus=%s\n' \
             "${id}" "${title}" "${item_manifest:--}" "${item_time:--}" "${status}" >> "${tmp}"
     done
@@ -707,7 +734,6 @@ fetch_workshop_mods() {
     fi
 
     dir="$(mods_dir)"
-    content_root="${WORKSHOP_STEAM_DIR}/content/${WORKSHOP_APP_ID}"
     if [ ! -d "${dir}" ]; then
         mkdir -p "${dir}"
         chmod 700 "${dir}"
@@ -715,21 +741,28 @@ fetch_workshop_mods() {
             chown "${RUN_USER}:${RUN_GROUP}" "${dir}"
         fi
     fi
+    # Created as the run user so that every parent it makes belongs to that user too: DepotDownloader
+    # keeps its account settings in ~/.local/share/IsolatedStorage, next to this directory, and aborts
+    # when it cannot create that.
+    if [ ! -d "${WORKSHOP_DIR}" ]; then
+        run_as_user mkdir -p "${WORKSHOP_DIR}"
+    fi
+    fetch_workshop_item_details
 
     echo "Workshop mods: fetching item(s) ${MODS_WORKSHOP_IDS} from app ${WORKSHOP_APP_ID} with an anonymous login..."
     failed=""
     for id in ${MODS_WORKSHOP_IDS}; do
         started="$(date +%s)"
         log="/tmp/necesse-workshop-${id}.log"
-        # SteamCMD exits 0 even when the download fails, so the success line is the only reliable
-        # signal. Its output is shown as usual, like the app update's.
-        run_as_user steamcmd +login anonymous +workshop_download_item "${WORKSHOP_APP_ID}" "${id}" +quit 2>&1 | tee "${log}" || true
-        # SteamCMD's last line has no newline; start ours on a fresh one.
-        echo
-        if ! grep -q "Success. Downloaded item ${id} to" "${log}"; then
-            reason="$(grep -o "ERROR! Download item ${id} failed ([^)]*)" "${log}" | head -n 1)"
-            reason="${reason#"ERROR! Download item ${id} failed ("}"
-            reason="${reason%)}"
+        item_dir="${WORKSHOP_DIR}/${id}"
+        # A fresh directory per fetch: DepotDownloader never deletes files, so a jar the author renamed
+        # would otherwise sit next to the new one. Its output is shown as usual, like the app update's.
+        rm -rf "${item_dir}"
+        run_as_user "${DEPOTDOWNLOADER_BIN}" -app "${WORKSHOP_APP_ID}" -pubfile "${id}" -dir "${item_dir}" 2>&1 | tee "${log}" || true
+        # DepotDownloader exits 0 even when the item does not exist ("Unable to locate manifest ID for
+        # published file <id>"), so the total it prints after a completed download is the reliable signal.
+        if ! grep -q '^Total downloaded: ' "${log}"; then
+            reason="$(grep -v -e '^Connecting to Steam3' -e '^Logging anonymously' -e '^No username given' -e '^Using Steam3' -e '^Disconnected from Steam' -e '^$' "${log}" | tail -n 1)"
             rm -f "${log}"
             echo "Workshop mods: item ${id} failed to download${reason:+ (${reason})}." >&2
             failed="${failed}${failed:+ }${id}"
@@ -737,13 +770,13 @@ fetch_workshop_mods() {
         fi
         rm -f "${log}"
 
-        jar_count="$(find "${content_root}/${id}" -maxdepth 1 -type f -name '*.jar' | wc -l)"
+        jar_count="$(find "${item_dir}" -maxdepth 1 -type f -name '*.jar' | wc -l)"
         if [ "${jar_count}" -ne 1 ]; then
             echo "Workshop mods: item ${id} downloaded but holds ${jar_count} .jar files where exactly one was expected; not a loadable Necesse mod." >&2
             failed="${failed}${failed:+ }${id}"
             continue
         fi
-        src="$(find "${content_root}/${id}" -maxdepth 1 -type f -name '*.jar')"
+        src="$(find "${item_dir}" -maxdepth 1 -type f -name '*.jar')"
         name="${src##*/}"
         dest="${dir}/ws-${id}-${name}"
 
@@ -799,27 +832,68 @@ fetch_workshop_mods() {
     echo "Workshop mods: done; see ${dir%/mods}/ws-manifest.txt."
 }
 
-get_manifest_buildid() {
-    # SteamCMD writes manifests into the install dir's steamapps folder when force_install_dir is used.
-    # Fall back to the per-user SteamCMD root for older layouts or if users override directories.
-    for manifest_path in \
-        "${APP_DIR}/steamapps/appmanifest_${APP_ID}.acf" \
-        "${RUN_HOME}/.local/share/Steam/steamapps/appmanifest_${APP_ID}.acf"
-    do
-        if [ -f "${manifest_path}" ]; then
-            awk -F'"' '/"buildid"/ {print $4; exit}' "${manifest_path}"
-            return
+# --- Game files: DepotDownloader -----------------------------------------------------------------
+# "<depot> <manifest>" lines from a DepotDownloader log: the line it prints for every depot it processes,
+# whether it downloads the manifest ("Got manifest request code for depot D from app A, manifest M, ...")
+# or already has it cached ("Already have manifest M for depot D."), with -manifest-only and with a
+# download alike. The Dockerfile's game stage applies the same two patterns to record the image's baseline.
+manifests_from_log() {
+    sed -n -e 's/^Got manifest request code for depot \([0-9]*\) from app [0-9]*, manifest \([0-9]*\),.*/\1 \2/p' \
+           -e 's/^Already have manifest \([0-9]*\) for depot \([0-9]*\)\..*/\2 \1/p' "$1" | sort -u
+}
+
+# "1006:6403079453713498174 1169375:6374287384649212625", for log lines.
+manifests_line() {
+    printf '%s\n' "$1" | tr ' ' ':' | tr '\n' ' ' | sed 's/ $//'
+}
+
+installed_manifests() {
+    if [ -f "${INSTALLED_MANIFESTS_FILE}" ]; then
+        sort -u "${INSTALLED_MANIFESTS_FILE}"
+    fi
+}
+
+# What Steam serves for the app right now: a -manifest-only run into a scratch directory, which fetches
+# the manifests (a few hundred KB) and no game files. Prints nothing when Steam cannot be reached.
+remote_manifests() {
+    scratch="/tmp/necesse-manifest-check"
+    log="${scratch}.log"
+    rm -rf "${scratch}" "${log}"
+    if ! run_as_user "${DEPOTDOWNLOADER_BIN}" -app "${APP_ID}" -os linux -osarch 64 -manifest-only -dir "${scratch}" >"${log}" 2>&1; then
+        rm -rf "${scratch}" "${log}"
+        return 1
+    fi
+    manifests_from_log "${log}"
+    rm -rf "${scratch}" "${log}"
+}
+
+# After a successful download: record what it installed, from its log, for the next check.
+record_installed_manifests() {
+    found="$(manifests_from_log "$1")"
+    if [ -z "${found}" ]; then
+        echo "WARN: could not read the depot manifests from DepotDownloader's output; the auto-update baseline is left as it was." >&2
+        return
+    fi
+    tmp="${INSTALLED_MANIFESTS_FILE}.tmp.$$"
+    printf '%s\n' "${found}" > "${tmp}"
+    if is_root; then
+        chown "${RUN_USER}:${RUN_GROUP}" "${tmp}"
+    fi
+    mv -f "${tmp}" "${INSTALLED_MANIFESTS_FILE}"
+}
+
+# DepotDownloader creates a directory for every path in the manifest, the two excluded ones included.
+prune_excluded_dirs() {
+    for d in "${APP_DIR}/jre" "${APP_DIR}/linux64"; do
+        if [ -d "${d}" ]; then
+            find "${d}" -depth -type d -empty -delete 2>/dev/null || true
         fi
     done
 }
 
-fetch_remote_buildid() {
-    run_as_user steamcmd \
-        +login anonymous \
-        +app_info_update 1 \
-        +app_info_print "${APP_ID}" \
-        +quit \
-        | awk -F'"' '/"buildid"/ {print $4; exit}'
+write_depot_filelist() {
+    printf '%s\n' "${DEPOT_FILELIST_RULE}" > "${DEPOT_FILELIST}"
+    chmod 644 "${DEPOT_FILELIST}"
 }
 
 calculate_auto_update_interval() {
@@ -839,11 +913,11 @@ calculate_auto_update_interval() {
 }
 
 check_for_remote_update() {
-    current="$(get_manifest_buildid || true)"
-    remote="$(fetch_remote_buildid || true)"
+    current="$(installed_manifests || true)"
+    remote="$(remote_manifests || true)"
 
     if [ -z "${remote}" ]; then
-        echo "Auto-update: unable to determine remote build ID." >&2
+        echo "Auto-update: unable to determine the remote build (DepotDownloader manifest check failed)." >&2
         return 1
     fi
 
@@ -853,7 +927,7 @@ check_for_remote_update() {
     fi
 
     if [ "${remote}" != "${current}" ]; then
-        echo "Auto-update: new build detected (local ${current}, remote ${remote})."
+        echo "Auto-update: new build detected (local $(manifests_line "${current}"), remote $(manifests_line "${remote}"))."
         return 0
     fi
 
@@ -957,7 +1031,7 @@ stop_server() {
 
 launch_server() {
     if [ ! -x "${JAVA_BIN}" ]; then
-        echo "Bundled JRE not found at ${JAVA_BIN}; the Steam build layout may have changed. Set JAVA_BIN to override." >&2
+        echo "Java runtime not found at ${JAVA_BIN}; the image's JRE is ${JAVA_HOME:-/opt/java/openjdk}/bin/java. Set JAVA_BIN to the JRE to launch with, or unset it." >&2
         exit 1
     fi
 
@@ -1089,21 +1163,33 @@ maybe_update_server() {
     fi
 
     if [ ! -f "$APP_DIR/Server.jar" ] || [ "$update_flag" = "true" ]; then
-        echo "Running SteamCMD to install or update Necesse..."
-        if run_as_user steamcmd +runscript "$STEAMCMD_DIR/update_necesse.txt"; then
-            echo "SteamCMD run complete."
+        echo "Running DepotDownloader to install or update Necesse (anonymous, app ${APP_ID})..."
+        write_depot_filelist
+        log="/tmp/necesse-update.log"
+        rc_file="/tmp/necesse-update.rc"
+        # The output is shown live and kept for the manifest record; the exit code travels through a
+        # file because a POSIX shell has no pipefail. -validate re-checks the files already in place,
+        # as SteamCMD's `app_update ... validate` did.
+        { run_as_user "${DEPOTDOWNLOADER_BIN}" -app "${APP_ID}" -os linux -osarch 64 -dir "${APP_DIR}" \
+              -filelist "${DEPOT_FILELIST}" -validate 2>&1; echo "$?" > "${rc_file}"; } | tee "${log}"
+        result="$(cat "${rc_file}")"
+        rm -f "${rc_file}"
+        if [ "${result}" -eq 0 ] && grep -q '^Total downloaded: ' "${log}" && [ -f "$APP_DIR/Server.jar" ]; then
+            record_installed_manifests "${log}"
+            prune_excluded_dirs
+            rm -f "${log}"
+            echo "DepotDownloader run complete."
         else
-            result=$?
-            echo "SteamCMD failed with exit code ${result}."
+            rm -f "${log}"
+            [ "${result}" -ne 0 ] || result=1
+            echo "DepotDownloader did not complete the download (exit code ${result}); its output is above."
             if [ -f "$APP_DIR/Server.jar" ]; then
                 echo "Keeping existing server build; new files were not applied."
-                echo "Check ${RUN_HOME}/.local/share/Steam/logs/stderr.txt for SteamCMD details."
                 rm -f "${AUTO_UPDATE_FLAG_FILE}"
                 return
             fi
 
-            echo "No existing server binaries found and SteamCMD failed; aborting start."
-            echo "Check ${RUN_HOME}/.local/share/Steam/logs/stderr.txt for SteamCMD details."
+            echo "No existing server binaries found and DepotDownloader failed; aborting start."
             exit "${result}"
         fi
     fi

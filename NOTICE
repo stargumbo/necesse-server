@@ -1,0 +1,35 @@
+Third-party software in the necesse-server image
+================================================
+
+This repository is MIT licensed (see LICENSE). The container image built from it also contains
+the following third-party software, each under its own license.
+
+DepotDownloader
+---------------
+  Version:   3.4.0 (GitHub release DepotDownloader_3.4.0; official linux-x64 and linux-arm64 builds)
+  License:   GNU General Public License v2.0 (GPL-2.0)
+  Source:    https://github.com/SteamRE/DepotDownloader/tree/DepotDownloader_3.4.0
+  Release:   https://github.com/SteamRE/DepotDownloader/releases/tag/DepotDownloader_3.4.0
+  In image:  /opt/depotdownloader/DepotDownloader  the unmodified release binary
+             /opt/depotdownloader/LICENSE          the GPL-2.0 text, as shipped in the release zip
+             /opt/depotdownloader/RELEASE.txt      asset name, download URL and the sha256 verified at build
+
+  DepotDownloader is used exactly as SteamRE released it. The Dockerfile downloads the zip for each
+  architecture by pinned version and sha256 (ARG DD_VERSION, DD_SHA256_AMD64, DD_SHA256_ARM64),
+  verifies it and unpacks it; it is not built from source, not modified and not vendored into this
+  repository. The image runs it as a separate program: at build time to fetch the game files from
+  Steam, and at run time for UPDATE_ON_START, AUTO_UPDATE_INTERVAL_MINUTES, MODS_WORKSHOP and
+  MODS_COLLECTION, always with Steam's anonymous dedicated-server access. The GPL-2.0 applies to
+  DepotDownloader itself; its corresponding source is the tagged tree linked above.
+
+Necesse dedicated server
+------------------------
+  The game files under /app (Server.jar, lib/, locale/, the start scripts, and the Steamworks
+  redistributables steamclient.so and libsteamwebrtc.so) are downloaded from Steam (app 1169370)
+  with the anonymous dedicated-server subscription. They belong to their respective owners and
+  are not covered by this repository's license; see /app/Licenses.txt inside the image.
+
+Eclipse Temurin
+---------------
+  The base image, eclipse-temurin:17-jre-noble (Ubuntu 24.04 with the Temurin 17 JRE), carries its
+  own licenses: https://hub.docker.com/_/eclipse-temurin and https://adoptium.net/docs/faq/.

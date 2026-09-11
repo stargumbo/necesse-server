@@ -56,19 +56,20 @@ Each release `vX.Y.Z` of this image is built against one Necesse version, `<game
 | Tag | Example | Points at | Moves when |
 | --- | --- | --- | --- |
 | `X` | `2` | newest image of that major (**recommended pin**) | every release and weekly rebuild within the major |
-| `X.Y` | `2.4` | newest image of that minor | every patch release and weekly rebuild within the minor |
-| `X.Y.Z` | `2.4.0` | that release | the weekly rebuild, while it is the newest release (same code, refreshed base image and Steam build) |
+| `X.Y` | `2.5` | newest image of that minor | every patch release and weekly rebuild within the minor |
+| `X.Y.Z` | `2.5.0` | that release | the weekly rebuild, while it is the newest release (same code, refreshed base image and Steam build) |
 | `latest` | `latest` | newest image | every release and weekly rebuild |
 | `<game>` | `1.3.3` | newest image built for that game version | every release built for that game version; a weekly rebuild only when the game version changed |
 | `<game major.minor>` | `1.3` | newest image built for that game minor | same rule as `<game>` |
-| `X.Y.Z-<game>` | `2.4.0-1.3.3` | exactly one image, forever | never |
+| `X.Y.Z-<game>` | `2.5.0-1.3.3` | exactly one image, forever | never |
 
 So `2` follows fixes and rebuilds without breaking changes, `1.3.3` follows the newest image that
-runs that game version, and `2.4.0-1.3.3` is the fully immutable pin. The weekly rebuild
-(Mondays, 05:17 UTC) exists so that the SteamCMD base image and the Steam server build stay
-current between releases; when Steam ships a new game version, the rebuild publishes new
-`<game>` tags for it and the previous `<game>` tags keep pointing at the last image built for the
-previous version. The image is built for `linux/amd64` only.
+runs that game version, and `2.5.0-1.3.3` is the fully immutable pin. The weekly rebuild
+(Mondays, 05:17 UTC) exists so that the base image and the Steam server build stay current
+between releases; when Steam ships a new game version, the rebuild publishes new `<game>` tags
+for it and the previous `<game>` tags keep pointing at the last image built for the previous
+version. Every tag is a manifest list for `linux/amd64` and `linux/arm64`; `docker pull` picks
+the platform of the host (see [arm64 notes](#arm64-notes)).
 
 ## Secrets
 
@@ -165,13 +166,13 @@ behaviour (cache, fallback, manifest, what gets deleted when) is in
 | `BIND_IP` | Specific IP/interface for the server to bind. |
 | `LOCAL_DIR` | `1` appends `-localdir` flag for local storage. |
 | `DATA_DIR`, `LOGS_DIR` | Override in-container paths (folders auto-created). |
-| `UPDATE_ON_START` | `true` runs SteamCMD on every boot. |
-| `AUTO_UPDATE_INTERVAL_MINUTES` | Background poll interval; the server is stopped via console `stop` (saving the world), updated, and restarted when a new Steam build is detected (`0` disables). |
+| `UPDATE_ON_START` | `true` refreshes the server files from Steam (DepotDownloader, anonymous) on every start; the image already ships the build current at its own build time. |
+| `AUTO_UPDATE_INTERVAL_MINUTES` | Background poll interval; the server is stopped via console `stop` (saving the world), updated, and restarted when a new Steam build is detected (a DepotDownloader manifest check; `0` disables). |
 | `MODS_COLLECTION` | One public Steam Workshop collection id, resolved at every start (no key, no login) into the items to install as `data/mods/ws-<id>-*.jar`; a restart applies collection edits (see Workshop mods). Blank disables; not allowed with `LOCAL_DIR=1`. |
 | `MODS_WORKSHOP` | Comma-separated Steam Workshop item ids to install the same way; union with the collection. Blank disables; not allowed with `LOCAL_DIR=1`. |
 | `MODS_FAIL_FAST` | `true` (default): a failed Workshop download, or a failed collection resolution with no `ws-collection.txt` to fall back to, stops the container before the server starts. `false`: warn and start with what fetched. |
 | `JAVA_OPTS` | Extra JVM flags (e.g. `-Xmx2G`). The official `StartServer-nogui.sh` uses `-XX:+UseG1GC -XX:MaxGCPauseMillis=50 …`; pass them here if you want the same tuning. |
-| `JAVA_BIN` | Path of the JRE to launch with (default `/app/jre/bin/java`, the JRE bundled with the Steam build). |
+| `JAVA_BIN` | Path of the JRE to launch with (default `/opt/java/openjdk/bin/java`, the image's Eclipse Temurin 17 JRE). |
 | `STOP_TIMEOUT_SECONDS` | How long the entrypoint waits for the server to exit after typing `stop` before falling back to `SIGTERM` (default `50`; keep it below the container's stop grace period). |
 | `PUID` / `PGID` | Host UID/GID to chown the bind mount to. The entrypoint remaps the `necesse` user before launching the JVM. |
 | `IMAGE_TAG` | Override image tag in the repository's Compose file (default `latest`). |
@@ -208,28 +209,50 @@ timeout is in [Internals](internals.md#graceful-stop).
 ## Updates and troubleshooting
 
 - **Image updates:** every Monday the publish workflow rebuilds the newest release tag against the
-  current SteamCMD base and the current Steam server build and re-pushes the same tags, so
+  current base image and the current Steam server build and re-pushes the same tags, so
   `docker compose pull && docker compose up -d` picks up a fresh image without a new release.
-- **In-container updates:** `UPDATE_ON_START=true` runs SteamCMD each start.
-  `AUTO_UPDATE_INTERVAL_MINUTES` (e.g. `60`) enables polling; when Steam publishes a new build the
-  server is stopped via console `stop`, updated, and restarted inside the same container.
-- **SteamCMD errors:** the container keeps the previous server build if SteamCMD fails; inspect
-  `/home/necesse/.local/share/Steam/logs/stderr.txt` inside the container for details.
+- **In-container updates:** `UPDATE_ON_START=true` refreshes the server files from Steam with
+  DepotDownloader at each start. `AUTO_UPDATE_INTERVAL_MINUTES` (e.g. `60`) enables polling; when
+  Steam publishes a new build the server is stopped via console `stop`, updated, and restarted
+  inside the same container.
+- **Download errors:** the container keeps the previous server build if DepotDownloader fails
+  (`DepotDownloader did not complete the download ...`); its own output is in `docker logs` just
+  above that line.
 - **Players cannot join:** confirm UDP port forwarding and public IP. Some port testers give false
   negatives; validate in-game if unsure.
 - **Config changes ignored:** edit `.env`, then `docker compose up -d` to recreate with new flags.
   Necesse rewrites `server.cfg` on a clean shutdown, so do not hand-edit it while the server runs;
   the environment variables are reapplied on every start.
-- **Bundled JRE missing:** if a future Steam build changes its layout the entrypoint exits with
-  `Bundled JRE not found at /app/jre/bin/java`; set `JAVA_BIN` to the new path.
+- **`Java runtime not found at ...`:** `JAVA_BIN` points at a path that does not exist in this image
+  (`/app/jre/bin/java` was the default up to 2.4.0). Unset it; the image's JRE is
+  `/opt/java/openjdk/bin/java`.
 - **Container exits with `Workshop mods: item(s) ... could not be fetched`:** the id is wrong, the
-  item was removed or hidden, or Steam was unreachable. Check the id in the Workshop URL; the
-  SteamCMD output just above names the reason (`File Not Found` for a bad id). Set
-  `MODS_FAIL_FAST=false` only if you accept starting with a partial mod set.
+  item was removed or hidden, or Steam was unreachable. Check the id in the Workshop URL; the line
+  just above names the reason (`Unable to locate manifest ID for published file <id>` for a bad
+  id). Set `MODS_FAIL_FAST=false` only if you accept starting with a partial mod set.
 - **Container exits with `... is not a public Steam Workshop collection`:** the collection is
   private or the id is wrong. Set it to public in Steam, or check the number in its URL.
 - **Players get "wrong mods":** compare `data/ws-manifest.txt` with what they have subscribed;
   every non-clientside mod must be present on both sides at the same version.
+
+## arm64 notes
+
+The image is published for `linux/amd64` and `linux/arm64` under the same tags; `docker pull`
+picks the platform of the host. A Raspberry Pi 5, an Ampere or Graviton VM and Docker Desktop on
+Apple Silicon all run the arm64 image natively. Nothing in this document is architecture-specific:
+same variables, same data layout, same console, same stop path, same Workshop handling; the game
+files are the same bytes on both, fetched by DepotDownloader running natively on either. The one
+visible difference is performance, which is the hardware's.
+
+Testing the arm64 image **under emulation** (`docker run --platform linux/arm64` on an x86 host,
+which runs it under qemu-user) has one known artifact: the server boots, loads worlds and accepts
+players, but after the console `stop` the world save completes and the process then fails to close
+its UDP socket (`Error in server ticking: ... IOException: Invalid argument` from
+`NativeThread.signal`) and never exits on its own. The entrypoint's `STOP_TIMEOUT_SECONDS` fallback
+sends `SIGTERM`, so `docker stop` still returns within the grace period and the world is saved, but
+the exit code is not 0. This does not happen on arm64 hardware: `.github/workflows/arm64.yml` runs
+the console stop on GitHub's `ubuntu-24.04-arm` runners on every pull request and it exits 0 within
+seconds. Do not run stop or socket-close checks under QEMU, and do not work around it in the image.
 
 ## Clone, develop, contribute
 
@@ -241,10 +264,17 @@ docker build -t necesse-server:dev .
 docker compose up -d
 ```
 
-- CI (`.github/workflows/ci.yml`) runs shellcheck and a full image build on pushes to `main` and
-  on pull requests.
-- `tests/run-fixtures.sh` exercises the compose files under `tests/fixtures/` (aliases, legacy
-  mounts, the password guard, world auto-detect, the console helper).
+- CI (`.github/workflows/ci.yml`) runs shellcheck, a full image build, `tests/run-platform.sh`
+  against it and the two-platform buildx build the publish workflow uses, on pushes to `main` and
+  on pull requests. `.github/workflows/arm64.yml` builds the image natively on an arm64 runner and
+  runs the same `tests/run-platform.sh` there.
+- `tests/run-platform.sh` is the architecture-independent suite (image contents, boot, world load,
+  console, password path, healthcheck, `UPDATE_ON_START`, the auto-update restart, Workshop mods,
+  console stop). `tests/run-fixtures.sh` exercises the compose files under `tests/fixtures/`
+  (aliases, legacy mounts, the password guard, world auto-detect, the console helper, the log diff
+  against the previous release); it needs an amd64 baseline image.
+- DepotDownloader is pinned in the `Dockerfile` (`DD_VERSION`, `DD_SHA256_AMD64`, `DD_SHA256_ARM64`);
+  bumping it means changing the three values together. Dependabot does not track it.
 - Release process:
   1. Update [`CHANGELOG.md`](../CHANGELOG.md) and documentation.
   2. `git tag -a vX.Y.Z -m "vX.Y.Z"` and `git push --follow-tags`.
@@ -263,7 +293,9 @@ docker compose up -d
 - [Necesse Multiplayer Linux guide](https://wiki.necesse.net/wiki/Multiplayer-Linux)
 - [ghcr.io/stargumbo/necesse-server](https://github.com/stargumbo/necesse-server/pkgs/container/necesse-server)
   and [hub.docker.com/r/stargumbo/necesse-server](https://hub.docker.com/r/stargumbo/necesse-server), the image
-- [steamcmd/docker](https://github.com/steamcmd/docker), the base image
+- [eclipse-temurin](https://hub.docker.com/_/eclipse-temurin), the base image
+- [SteamRE/DepotDownloader](https://github.com/SteamRE/DepotDownloader), fetches the game files
+  (GPL-2.0; see [NOTICE](../NOTICE))
 - [andreas-glaser/necesse-docker-server](https://github.com/andreas-glaser/necesse-docker-server), upstream
 
 ## License
