@@ -80,12 +80,15 @@ jobs:
           printf 'regex:^(?!jre/|linux64/).*$\n' > filelist.txt
           dd/DepotDownloader -app "${NECESSE_APPID}" -os linux -osarch 64 -dir game -filelist filelist.txt
           test -f game/Server.jar
-          if [ -e game/jre ] || [ -e game/linux64 ]; then
-            echo "::error::the filelist did not exclude jre/ or linux64/" >&2
-            ls game
+          # DepotDownloader creates every directory named in the manifest even when the filelist matches
+          # none of its files, so test for files, not for the directories, then drop the empty shells.
+          if [ -n "$(find game/jre game/linux64 -type f 2>/dev/null | head -n1)" ]; then
+            echo "::error::the filelist did not exclude jre/ or linux64/:" >&2
+            find game/jre game/linux64 -type f 2>/dev/null | head -n 20 >&2
             exit 1
           fi
-          rm -rf game/.DepotDownloader
+          rm -rf game/jre game/linux64 game/.DepotDownloader
+          ls game
           sha256sum game/Server.jar | tee server-jar.sha256
           echo "game tree: $(du -sh game | cut -f1), $(find game -type f | wc -l) files"
 
