@@ -1,15 +1,21 @@
 name: Publish
 
-# One build, two registries, identical digests.
+# One build, two platforms, two registries, identical digests.
 #   ghcr.io/stargumbo/necesse-server     always
 #   docker.io/stargumbo/necesse-server   when the DOCKERHUB_USERNAME / DOCKERHUB_TOKEN repository secrets exist
 #
+# Every tag is a manifest list covering linux/amd64 and linux/arm64. The game files are fetched from Steam
+# once, natively on this runner (the Dockerfile's fetch stages run on the build platform), and only the
+# arm64 runtime stage's apt-get runs under QEMU; the digest that is verified across registries is the
+# manifest list's.
+#
 #   - push of a v* tag:  builds that tag -> :X.Y.Z, :X.Y, :X, :latest, plus the game-version tags
-#                        :X.Y.Z-<game>, :<game>, :<game major.minor> (e.g. 2.3.1-1.3.3, 1.3.3, 1.3).
-#   - weekly (Mondays) and manual dispatch: rebuilds the newest v* tag with pull: true so the SteamCMD base
-#                        image and the Steam server build refresh unattended, and pushes the same semver tag
-#                        set. The floating game-version tags move only when the game version actually changed
-#                        (i.e. :<game> does not exist yet); :X.Y.Z-<game> is never re-pointed once it exists.
+#                        :X.Y.Z-<game>, :<game>, :<game major.minor> (e.g. 2.5.0-1.3.3, 1.3.3, 1.3).
+#   - weekly (Mondays) and manual dispatch: rebuilds the newest v* tag with pull: true and a fresh
+#                        STEAM_REFRESH build argument, so the base image and the Steam server build refresh
+#                        unattended, and pushes the same semver tag set. The floating game-version tags move
+#                        only when the game version actually changed (i.e. :<game> does not exist yet);
+#                        :X.Y.Z-<game> is never re-pointed once it exists.
 #
 # The game version is read from Server.jar inside the image that was just pushed (scripts/game-version.py);
 # nothing is hard-coded. This workflow never changes the image itself, and it does not touch the Docker Hub
@@ -29,6 +35,7 @@ permissions:
 env:
   GHCR_IMAGE: ghcr.io/${{ github.repository }}
   HUB_IMAGE: docker.io/stargumbo/necesse-server
+  PLATFORMS: linux/amd64,linux/arm64
   # Secrets cannot be tested in `if:` directly, so the username is copied into the environment; every
   # Docker Hub step is skipped (with a notice) while it is empty and GHCR publishing is unaffected.
   DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -63,6 +70,9 @@ jobs:
           echo "version=${tag#v}" >>"$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
           echo "Building ${tag} at $(git rev-parse --short HEAD)"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -109,18 +119,22 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          platforms: linux/amd64
+          platforms: ${{ env.PLATFORMS }}
           push: true
           pull: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # STEAM_REFRESH busts the cache of the game-fetch layer: without it a weekly rebuild whose base image
+          # did not change would reuse last week's Steam build from the layer cache.
           build-args: |
             BUILD_VERSION=${{ steps.ref.outputs.version }}
             BUILD_REVISION=${{ steps.ref.outputs.sha }}
+            STEAM_REFRESH=${{ github.run_id }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Verify the digest is identical in every registry
+      - name: Verify the manifest list is identical in every registry and covers every platform
+        id: platforms
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
           VERSION: ${{ steps.ref.outputs.version }}
@@ -134,7 +148,24 @@ jobs:
               echo "::error::${image}:${VERSION} resolves to ${got} but the build pushed ${DIGEST}; the registries disagree. Stopping before any game-version tag is created." >&2
               exit 1
             fi
+            # One platform manifest per requested platform, no "unknown" attestation entries counted.
+            platforms="$(docker buildx imagetools inspect "${image}:${VERSION}" --raw \
+              | jq -r '.manifests[] | select(.platform.os != "unknown") | "\(.platform.os)/\(.platform.architecture) \(.digest) \(.size)"' | sort)"
+            echo "${platforms}"
+            for want in $(tr ',' ' ' <<<"${PLATFORMS}"); do
+              if ! grep -q "^${want} " <<<"${platforms}"; then
+                echo "::error::${image}:${VERSION} has no ${want} manifest; the tag is not a complete manifest list. Stopping." >&2
+                exit 1
+              fi
+            done
           done
+          # Per-platform digests of the GHCR list, for the step summary (identical on Docker Hub by the check above).
+          {
+            echo "per_platform<<EOF"
+            docker buildx imagetools inspect "${GHCR_IMAGE}:${VERSION}" --raw \
+              | jq -r '.manifests[] | select(.platform.os != "unknown") | "\(.platform.os)/\(.platform.architecture) \(.digest)"' | sort
+            echo "EOF"
+          } >>"$GITHUB_OUTPUT"
 
       - name: Read the game version from the pushed image
         id: game
@@ -142,20 +173,23 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
+          # Server.jar is the same file on both platforms (the game stage is shared); amd64 is this runner's.
           ref="${GHCR_IMAGE}@${DIGEST}"
-          docker pull -q "${ref}"
-          cid="$(docker create "${ref}")"
+          docker pull -q --platform linux/amd64 "${ref}"
+          cid="$(docker create --platform linux/amd64 "${ref}")"
           docker cp "${cid}:/app/Server.jar" ./Server.jar
           docker rm "${cid}" >/dev/null
           game="$(python3 "${RUNNER_TEMP}/game-version.py" ./Server.jar)"
+          jar_sha="$(sha256sum ./Server.jar | cut -d' ' -f1)"
           rm -f ./Server.jar
           case "${game}" in
             *.*.*) minor="${game%.*}" ;;
             *)     minor="${game}" ;;
           esac
-          echo "Game version in ${ref}: ${game} (floating minor tag ${minor})"
+          echo "Game version in ${ref}: ${game} (floating minor tag ${minor}); Server.jar sha256 ${jar_sha}"
           echo "version=${game}" >>"$GITHUB_OUTPUT"
           echo "minor=${minor}" >>"$GITHUB_OUTPUT"
+          echo "jar_sha256=${jar_sha}" >>"$GITHUB_OUTPUT"
 
       - name: Push the game-version tags
         env:
@@ -164,6 +198,8 @@ jobs:
           IMAGES: ${{ steps.registries.outputs.images }}
           GAME: ${{ steps.game.outputs.version }}
           GAME_MINOR: ${{ steps.game.outputs.minor }}
+          JAR_SHA256: ${{ steps.game.outputs.jar_sha256 }}
+          PER_PLATFORM: ${{ steps.platforms.outputs.per_platform }}
           EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
@@ -218,6 +254,7 @@ jobs:
                   echo "::error::${image}:${pin} already exists at ${existing}; that tag is immutable and is not moved to ${DIGEST}." >&2
                   exit 1
                 fi
+                # imagetools create copies the whole manifest list, so the game-version tags cover both platforms too.
                 set -- "${image}@${DIGEST}"
                 for t in ${floating} ${pin}; do
                   set -- -t "${image}:${t}" "$@"
@@ -230,6 +267,14 @@ jobs:
 
           {
             echo "### ${GHCR_IMAGE#ghcr.io/} ${VERSION} (game ${GAME})"
+            echo
+            echo "Manifest list ${DIGEST} (${PLATFORMS}); Server.jar sha256 ${JAR_SHA256}"
+            echo
+            echo "| Platform | Manifest digest |"
+            echo "| --- | --- |"
+            while read -r platform digest; do
+              [ -n "${platform}" ] && echo "| ${platform} | ${digest} |"
+            done <<<"${PER_PLATFORM}"
             echo
             echo "| Registry | Tag | Digest |"
             echo "| --- | --- | --- |"

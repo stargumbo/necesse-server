@@ -64,7 +64,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ env.HUB_REPOSITORY }}
           # Docker Hub truncates the short description at 100 characters; keep this under it.
-          short-description: "Necesse dedicated server: SteamCMD base, bundled JRE, saves on stop, Workshop mod collections."
+          short-description: "Necesse dedicated server, amd64 and arm64: saves on stop, self-updating, Workshop mod collections."
           readme-filepath: ./hub-overview.md
           # The banner is already an absolute raw.githubusercontent.com URL; url completion is for the relative
           # links to LICENSE, CHANGELOG.md, docker-compose.yml and docs/, which Hub would otherwise render dead.
