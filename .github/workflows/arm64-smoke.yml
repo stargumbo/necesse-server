@@ -1,0 +1,222 @@
+name: arm64 smoke
+
+# Phase 1 gate for linux/arm64 support (image 2.5.0). Runs on a GitHub-hosted arm64 runner, i.e. real
+# hardware rather than QEMU, and answers the two questions the workstation discovery could not:
+#
+#   1. can this repository schedule `ubuntu-24.04-arm` at all;
+#   2. does the console `stop` path complete on real arm64 hardware. Under qemu-user it never does:
+#      DatagramSocket.close fails with EINVAL in NativeThread.signal after the world save, the server
+#      falls into a crash loop and the process has to be killed. That was reproduced as an emulator
+#      artifact with a 25-line Java program, but only a native run can prove it stays in the emulator.
+#
+# The job builds a minimal probe -- eclipse-temurin:17-jre-noble plus the game files fetched anonymously
+# by DepotDownloader without jre/ or linux64/ (the developer's own Linux server zip ships without them) --
+# boots a throwaway world, types `stop` into the server's stdin FIFO exactly as entrypoint.sh does, and
+# asserts the save line and an exit within 30 s. Nothing here touches the published image, the
+# Dockerfile or the entrypoint. Phase 2 turns this job into the permanent arm64 fixture job.
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Official release binary, pinned by version and sha256; used as shipped, never built or modified.
+  # DepotDownloader is GPL-2.0: https://github.com/SteamRE/DepotDownloader
+  DD_VERSION: "3.4.0"
+  DD_ASSET: DepotDownloader-linux-arm64.zip
+  DD_SHA256: d9fb612ccebc1db8eeea3b4045d2221ec70431381393ce908fb72f01d4f9c812
+  # Necesse Dedicated Server on Steam. Anonymous access is enough for dedicated-server depots.
+  NECESSE_APPID: "1169370"
+  BOOT_DEADLINE_SECONDS: "180"
+  STOP_DEADLINE_SECONDS: "30"
+
+jobs:
+  console-stop-on-real-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Runner is native arm64
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          echo "uname -m: ${arch}; $(nproc) vCPU; kernel $(uname -r)"
+          grep -m1 -iE 'model name|CPU implementer' /proc/cpuinfo || true
+          free -h | sed -n 2p
+          if [ "${arch}" != "aarch64" ]; then
+            echo "::error::expected an aarch64 runner, got ${arch}; the ubuntu-24.04-arm label did not resolve to ARM hardware" >&2
+            exit 1
+          fi
+          # A qemu-user setup would register aarch64 in binfmt_misc on an x86 host; a native runner has no such entry.
+          if compgen -G '/proc/sys/fs/binfmt_misc/qemu-aarch64*' >/dev/null; then
+            echo "::error::qemu-aarch64 is registered in binfmt_misc; this is not a native arm64 host" >&2
+            exit 1
+          fi
+          echo "docker server arch: $(docker version --format '{{.Server.Arch}}')"
+
+      - name: Fetch DepotDownloader (pinned release, sha256 verified)
+        run: |
+          set -euo pipefail
+          url="https://github.com/SteamRE/DepotDownloader/releases/download/DepotDownloader_${DD_VERSION}/${DD_ASSET}"
+          echo "Fetching ${url}"
+          curl -fsSL --retry 3 -o dd.zip "${url}"
+          echo "${DD_SHA256}  dd.zip" | sha256sum -c -
+          mkdir -p dd
+          unzip -q dd.zip -d dd
+          chmod +x dd/DepotDownloader
+          dd/DepotDownloader -V
+
+      - name: Fetch the game files anonymously (no jre/, no linux64/)
+        run: |
+          set -euo pipefail
+          # Same filelist the image will use on both architectures: Steam's x86-64 JRE and the Steamworks
+          # natives are left out; the JRE is always the base Temurin.
+          printf 'regex:^(?!jre/|linux64/).*$\n' > filelist.txt
+          dd/DepotDownloader -app "${NECESSE_APPID}" -os linux -osarch 64 -dir game -filelist filelist.txt
+          test -f game/Server.jar
+          # DepotDownloader creates every directory named in the manifest even when the filelist matches
+          # none of its files, so test for files, not for the directories, then drop the empty shells.
+          if [ -n "$(find game/jre game/linux64 -type f 2>/dev/null | head -n1)" ]; then
+            echo "::error::the filelist did not exclude jre/ or linux64/:" >&2
+            find game/jre game/linux64 -type f 2>/dev/null | head -n 20 >&2
+            exit 1
+          fi
+          rm -rf game/jre game/linux64 game/.DepotDownloader
+          ls game
+          sha256sum game/Server.jar | tee server-jar.sha256
+          echo "game tree: $(du -sh game | cut -f1), $(find game -type f | wc -l) files"
+
+      - name: Build the probe image
+        run: |
+          set -euo pipefail
+          # Minimal stand-in for entrypoint.sh's console handling: the server's stdin is a FIFO held open
+          # read-write, so `stop` can be typed from outside the process (docker exec ... > the FIFO), which
+          # is exactly how the image stops the server. exec keeps java as PID 1 so the container exit code
+          # is the server's own.
+          cat > probe.sh <<'EOF'
+          #!/bin/sh
+          set -eu
+          mkfifo -m 600 /tmp/necesse-console
+          exec 3<>/tmp/necesse-console
+          cd /app
+          exec java -jar Server.jar -nogui -localdir -world probe -port 14159 -slots 4 -pausewhenempty 0 -logging 1 <&3
+          EOF
+          cat > Dockerfile.probe <<'EOF'
+          FROM eclipse-temurin:17-jre-noble
+          COPY game /app
+          COPY --chmod=755 probe.sh /probe.sh
+          WORKDIR /app
+          ENTRYPOINT ["/probe.sh"]
+          EOF
+          docker build --pull -f Dockerfile.probe -t necesse-arm64-probe .
+          docker image inspect necesse-arm64-probe --format 'probe image: {{.Os}}/{{.Architecture}}, {{.Size}} bytes'
+
+      - name: Boot the server and load a world
+        id: boot
+        run: |
+          set -euo pipefail
+          t0="$(date +%s)"
+          docker run -d --name probe --stop-timeout 60 necesse-arm64-probe >/dev/null
+          started=0
+          for _ in $(seq 1 "${BOOT_DEADLINE_SECONDS}"); do
+            if docker logs probe 2>&1 | grep -q 'Started server'; then
+              started=1
+              break
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' probe)" != "true" ]; then
+              docker logs probe 2>&1 | tail -n 100
+              echo "::error::the server exited (code $(docker inspect -f '{{.State.ExitCode}}' probe)) before logging 'Started server'" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "${started}" != "1" ]; then
+            docker logs probe 2>&1 | tail -n 100
+            echo "::error::no 'Started server' line within ${BOOT_DEADLINE_SECONDS} s" >&2
+            exit 1
+          fi
+          boot="$(( $(date +%s) - t0 ))"
+          echo "boot_seconds=${boot}" >> "$GITHUB_OUTPUT"
+          echo "container start -> 'Started server': ${boot} s"
+          docker logs probe 2>&1 | grep -E 'Natives path|world|Started server' || true
+          # Let it tick for a few seconds so the stop is exercised against a live, listening server.
+          sleep 5
+
+      - name: Console stop saves the world and exits within the deadline
+        id: stop
+        run: |
+          set -euo pipefail
+          t0="$(date +%s)"
+          docker exec probe sh -c 'echo stop > /tmp/necesse-console'
+          code="running"
+          for _ in $(seq 1 "${STOP_DEADLINE_SECONDS}"); do
+            if [ "$(docker inspect -f '{{.State.Running}}' probe)" != "true" ]; then
+              code="$(docker inspect -f '{{.State.ExitCode}}' probe)"
+              break
+            fi
+            sleep 1
+          done
+          elapsed="$(( $(date +%s) - t0 ))"
+          log="$(docker logs probe 2>&1)"
+          echo "stop_seconds=${elapsed}" >> "$GITHUB_OUTPUT"
+          echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
+          echo "stop -> exit: ${elapsed} s, exit code ${code}"
+          echo "--- last log lines ---"
+          tail -n 25 <<<"${log}"
+          echo "----------------------"
+
+          failed=0
+          if [ "${code}" = "running" ]; then
+            echo "::error::the server was still running ${STOP_DEADLINE_SECONDS} s after 'stop' -- the qemu-user symptom, now observed on real hardware" >&2
+            docker kill probe >/dev/null 2>&1 || true
+            failed=1
+          fi
+          if ! grep -q 'Completed world save before stopping server' <<<"${log}"; then
+            echo "::error::'Completed world save before stopping server' was not logged" >&2
+            failed=1
+          fi
+          if grep -q 'Error in server ticking' <<<"${log}"; then
+            echo "::error::'Error in server ticking' after stop: the post-stop socket close failed on this hardware" >&2
+            failed=1
+          fi
+          if [ "${failed}" = "0" ] && [ "${code}" != "0" ]; then
+            echo "::warning::the server exited ${code} after a clean console stop; amd64 exits 0" >&2
+          fi
+          exit "${failed}"
+
+      - name: Summary
+        if: always()
+        env:
+          BOOT_SECONDS: ${{ steps.boot.outputs.boot_seconds }}
+          STOP_SECONDS: ${{ steps.stop.outputs.stop_seconds }}
+          EXIT_CODE: ${{ steps.stop.outputs.exit_code }}
+        run: |
+          {
+            echo "### arm64 smoke: console stop on real hardware"
+            echo
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Runner | $(uname -m), $(nproc) vCPU, $(grep -m1 -iE 'model name|CPU implementer' /proc/cpuinfo | cut -d: -f2- | xargs || echo n/a) |"
+            echo "| DepotDownloader | ${DD_VERSION} (${DD_ASSET}, sha256 ${DD_SHA256}) |"
+            echo "| Server.jar sha256 | $(cut -d' ' -f1 server-jar.sha256 2>/dev/null || echo n/a) |"
+            echo "| Container start to 'Started server' | ${BOOT_SECONDS:-n/a} s |"
+            echo "| Console stop to process exit | ${STOP_SECONDS:-n/a} s, exit code ${EXIT_CODE:-n/a} |"
+            echo
+            echo '```'
+            docker logs probe 2>&1 | grep -E 'Started server|stop|Starting world save|Completed world save|Stopped server|Error in server ticking' | tail -n 12 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Full server log (on failure)
+        if: failure()
+        run: docker logs probe 2>&1 | tail -n 300 || true
+
+      - name: Clean up
+        if: always()
+        run: docker rm -f probe >/dev/null 2>&1 || true
